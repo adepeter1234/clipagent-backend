@@ -1,0 +1,16 @@
+{
+  "name": "clipagent-backend",
+  "version": "1.0.0",
+  "description": "ClipAgent AI Backend — YouTube monitor and auto-poster",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "axios": "^1.6.0",
+    "node-cron": "^3.0.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1"
+  }
+}
