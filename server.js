@@ -532,3 +532,6 @@ app.listen(PORT, () => {
   log("ClipAgent running on port " + PORT, "success");
   console.log("ClipAgent started on port " + PORT);
 });
+cron.schedule('0 * * * *', async () => {
+  await runClipAgent();
+});
