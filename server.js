@@ -495,17 +495,30 @@ async function postClip(clip, channel) {
 // ================================================
 // AUTO SCAN — Every 5 minutes
 // ================================================
-cron.schedule("*/5 * * * *", async () => {
-  const active = channels.filter(c => c.status === "active");
-  if (!active.length) return;
-  log("Auto-scan: " + active.length + " channel(s)", "info");
-  for (const ch of active) await scanChannel(ch);
+// ================================================
+// AUTO SCAN — Every Hour
+// ================================================
+cron.schedule('0 * * * *', async () => {
+  try {
+    const active = channels.filter(c => c.status === "active");
+    if (!active.length) return;
+
+    log("Auto-scan: " + active.length + " channel(s)", "info");
+
+    for (const ch of active) {
+      await scanChannel(ch);
+    }
+
+  } catch (err) {
+    log("Auto-scan error: " + err.message, "error");
+  }
 });
 
+
 // ================================================
-// AUTO REFRESH TOKEN — Every 50 days
+// AUTO REFRESH TOKEN — Every Day (SAFE)
 // ================================================
-cron.schedule("0 0 */50 * *", async () => {
+cron.schedule("0 0 * * *", async () => {
   try {
     const r = await axios.get("https://graph.facebook.com/v25.0/oauth/access_token", {
       params: {
@@ -515,23 +528,24 @@ cron.schedule("0 0 */50 * *", async () => {
         fb_exchange_token: process.env.INSTAGRAM_ACCESS_TOKEN
       }
     });
+
     if (r.data.access_token) {
       process.env.INSTAGRAM_ACCESS_TOKEN = r.data.access_token;
       log("Token auto-refreshed", "success");
     }
+
   } catch (err) {
     log("Token refresh error: " + err.message, "warn");
   }
 });
 
+
 // ================================================
-// START
+// START SERVER
 // ================================================
 const PORT = process.env.PORT || 3000;
+
 app.listen(PORT, () => {
   log("ClipAgent running on port " + PORT, "success");
   console.log("ClipAgent started on port " + PORT);
-});
-cron.schedule('0 * * * *', async () => {
-  await runClipAgent();
 });
