@@ -1,348 +1,438 @@
-require('dotenv').config();
-const express = require('express');
-const axios = require('axios');
-const cron = require('node-cron');
-const cors = require('cors');
+require("dotenv").config();
+const express = require("express");
+const axios = require("axios");
+const cron = require("node-cron");
+const cors = require("cors");
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// =============================================
-// IN-MEMORY STORE (channels + clips)
-// =============================================
+// ================================================
+// IN-MEMORY DATA STORE
+// ================================================
 let channels = [];
 let clips = [];
 let logs = [];
 
-function addLog(msg, type = 'info') {
+function log(msg, type = "info") {
   const entry = { time: new Date().toISOString(), msg, type };
   logs.unshift(entry);
-  if (logs.length > 100) logs.pop();
+  if (logs.length > 200) logs.pop();
   console.log(`[${type.toUpperCase()}] ${msg}`);
 }
 
-// =============================================
-// HEALTH CHECK
-// =============================================
-app.get('/', (req, res) => {
-  res.json({ status: 'ClipAgent running', channels: channels.length, clips: clips.length, uptime: process.uptime() });
-});
-
-// =============================================
-// CHANNELS API
-// =============================================
-app.get('/api/channels', (req, res) => res.json(channels));
-
-app.post('/api/channels', async (req, res) => {
-  const { url, name, clipLength = 60, postTo = 'all', autoPost = true } = req.body;
-  if (!url) return res.status(400).json({ error: 'URL required' });
-  if (channels.length >= 10) return res.status(400).json({ error: 'Max 10 channels' });
-  if (channels.find(c => c.url === url)) return res.status(400).json({ error: 'Channel already exists' });
-
-  try {
-    const channelId = extractChannelId(url);
-    const info = await fetchYouTubeChannelInfo(channelId);
-    const channel = {
-      id: Date.now().toString(),
-      url, name: name || info.name || channelId,
-      ytId: info.ytId || channelId,
-      clipLength, postTo, autoPost,
-      status: 'active',
-      clipsGenerated: 0,
-      postsPublished: 0,
-      lastScanned: null,
-      addedAt: new Date().toISOString()
-    };
-    channels.push(channel);
-    addLog(`Channel added: ${channel.name}`, 'success');
-    res.json(channel);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.delete('/api/channels/:id', (req, res) => {
-  const ch = channels.find(c => c.id === req.params.id);
-  channels = channels.filter(c => c.id !== req.params.id);
-  addLog(`Channel removed: ${ch?.name}`, 'warn');
-  res.json({ success: true });
-});
-
-app.patch('/api/channels/:id/toggle', (req, res) => {
-  const ch = channels.find(c => c.id === req.params.id);
-  if (!ch) return res.status(404).json({ error: 'Not found' });
-  ch.status = ch.status === 'active' ? 'paused' : 'active';
-  res.json(ch);
-});
-
-// =============================================
-// CLIPS API
-// =============================================
-app.get('/api/clips', (req, res) => res.json(clips));
-
-app.delete('/api/clips/:id', (req, res) => {
-  clips = clips.filter(c => c.id !== req.params.id);
-  res.json({ success: true });
-});
-
-app.post('/api/clips/:id/post', async (req, res) => {
-  const clip = clips.find(c => c.id === req.params.id);
-  if (!clip) return res.status(404).json({ error: 'Clip not found' });
-  const ch = channels.find(c => c.id === clip.channelId);
-  await postClip(clip, ch);
-  res.json({ success: true });
-});
-
-// =============================================
-// LOGS + STATS
-// =============================================
-app.get('/api/logs', (req, res) => res.json(logs));
-
-app.get('/api/stats', (req, res) => {
+// ================================================
+// ROOT — Health Check
+// ================================================
+app.get("/", (req, res) => {
   res.json({
+    name: "ClipAgent Backend",
+    status: "running",
+    uptime_seconds: Math.floor(process.uptime()),
     channels: channels.length,
     clips: clips.length,
-    posts: clips.filter(c => c.status === 'posted').length,
-    earnings: (clips.filter(c => c.status === 'posted').length * 250 * 0.0025).toFixed(2)
+    posts: clips.filter((c) => c.status === "posted").length,
   });
 });
 
-// =============================================
-// MANUAL SCAN TRIGGER
-// =============================================
-app.post('/api/scan', async (req, res) => {
-  const { channelId } = req.body;
-  if (channelId) {
-    const ch = channels.find(c => c.id === channelId);
-    if (ch) { await scanChannel(ch); return res.json({ success: true }); }
-  } else {
-    for (const ch of channels.filter(c => c.status === 'active')) {
-      await scanChannel(ch);
-    }
-  }
-  res.json({ success: true, scanned: channels.filter(c => c.status === 'active').length });
+// ================================================
+// STATS
+// ================================================
+app.get("/api/stats", (req, res) => {
+  const posted = clips.filter((c) => c.status === "posted").length;
+  res.json({
+    channels: channels.length,
+    clips: clips.length,
+    posts: posted,
+    earnings: (posted * 250 * 0.0025).toFixed(2),
+  });
 });
 
-// =============================================
-// YOUTUBE HELPERS
-// =============================================
-function extractChannelId(url) {
-  const match = url.match(/youtube\.com\/@([^\/\?]+)/) ||
-    url.match(/youtube\.com\/channel\/([^\/\?]+)/) ||
-    url.match(/youtube\.com\/c\/([^\/\?]+)/);
-  return match ? match[1] : url.replace(/.*\//, '').replace('@', '');
+// ================================================
+// LOGS
+// ================================================
+app.get("/api/logs", (req, res) => {
+  res.json(logs.slice(0, 50));
+});
+
+// ================================================
+// CHANNELS — Get All
+// ================================================
+app.get("/api/channels", (req, res) => {
+  res.json(channels);
+});
+
+// ================================================
+// CHANNELS — Add New (max 10)
+// ================================================
+app.post("/api/channels", async (req, res) => {
+  try {
+    const { url, name, clipLength = 60, postTo = "all", autoPost = true } = req.body;
+
+    if (!url) return res.status(400).json({ error: "YouTube channel URL is required" });
+    if (channels.length >= 10) return res.status(400).json({ error: "Maximum of 10 channels reached" });
+    if (channels.find((c) => c.url === url)) return res.status(400).json({ error: "This channel is already added" });
+
+    const handle = extractHandle(url);
+    const info = await getYouTubeChannelInfo(handle);
+
+    const channel = {
+      id: Date.now().toString(),
+      url,
+      name: name || info.name || handle,
+      ytId: info.ytId || handle,
+      clipLength: parseInt(clipLength),
+      postTo,
+      autoPost: Boolean(autoPost),
+      status: "active",
+      clipsGenerated: 0,
+      postsPublished: 0,
+      lastScanned: null,
+      addedAt: new Date().toISOString(),
+    };
+
+    channels.push(channel);
+    log(`Channel added: ${channel.name}`, "success");
+    res.json(channel);
+  } catch (err) {
+    log(`Add channel error: ${err.message}`, "error");
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ================================================
+// CHANNELS — Delete
+// ================================================
+app.delete("/api/channels/:id", (req, res) => {
+  const ch = channels.find((c) => c.id === req.params.id);
+  if (!ch) return res.status(404).json({ error: "Channel not found" });
+  channels = channels.filter((c) => c.id !== req.params.id);
+  log(`Channel removed: ${ch.name}`, "warn");
+  res.json({ success: true });
+});
+
+// ================================================
+// CHANNELS — Pause / Resume Toggle
+// ================================================
+app.patch("/api/channels/:id/toggle", (req, res) => {
+  const ch = channels.find((c) => c.id === req.params.id);
+  if (!ch) return res.status(404).json({ error: "Channel not found" });
+  ch.status = ch.status === "active" ? "paused" : "active";
+  log(`Channel ${ch.status}: ${ch.name}`, "info");
+  res.json(ch);
+});
+
+// ================================================
+// CLIPS — Get All
+// ================================================
+app.get("/api/clips", (req, res) => {
+  res.json(clips);
+});
+
+// ================================================
+// CLIPS — Delete
+// ================================================
+app.delete("/api/clips/:id", (req, res) => {
+  const clip = clips.find((c) => c.id === req.params.id);
+  if (!clip) return res.status(404).json({ error: "Clip not found" });
+  clips = clips.filter((c) => c.id !== req.params.id);
+  log(`Clip deleted: ${clip.clipTitle}`, "warn");
+  res.json({ success: true });
+});
+
+// ================================================
+// CLIPS — Manually Post a Clip
+// ================================================
+app.post("/api/clips/:id/post", async (req, res) => {
+  try {
+    const clip = clips.find((c) => c.id === req.params.id);
+    if (!clip) return res.status(404).json({ error: "Clip not found" });
+    const ch = channels.find((c) => c.id === clip.channelId);
+    await postClip(clip, ch);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ================================================
+// SCAN — Trigger Manually
+// ================================================
+app.post("/api/scan", async (req, res) => {
+  try {
+    const { channelId } = req.body;
+    if (channelId) {
+      const ch = channels.find((c) => c.id === channelId);
+      if (!ch) return res.status(404).json({ error: "Channel not found" });
+      await scanChannel(ch);
+      return res.json({ success: true, channel: ch.name });
+    }
+    const active = channels.filter((c) => c.status === "active");
+    for (const ch of active) await scanChannel(ch);
+    res.json({ success: true, scanned: active.length });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ================================================
+// YOUTUBE — Extract handle from URL
+// ================================================
+function extractHandle(url) {
+  const m =
+    url.match(/youtube\.com\/@([^\/\?&]+)/) ||
+    url.match(/youtube\.com\/channel\/([^\/\?&]+)/) ||
+    url.match(/youtube\.com\/c\/([^\/\?&]+)/) ||
+    url.match(/youtube\.com\/user\/([^\/\?&]+)/);
+  return m ? m[1] : url.replace(/.*\//, "").replace("@", "");
 }
 
-async function fetchYouTubeChannelInfo(handle) {
+// ================================================
+// YOUTUBE — Fetch Channel Info
+// ================================================
+async function getYouTubeChannelInfo(handle) {
   try {
-    const res = await axios.get('https://www.googleapis.com/youtube/v3/search', {
-      params: { part: 'snippet', type: 'channel', q: handle, key: process.env.YOUTUBE_API_KEY, maxResults: 1 }
+    const res = await axios.get("https://www.googleapis.com/youtube/v3/search", {
+      params: {
+        part: "snippet",
+        type: "channel",
+        q: handle,
+        maxResults: 1,
+        key: process.env.YOUTUBE_API_KEY,
+      },
     });
-    if (res.data.items?.length > 0) {
-      return { name: res.data.items[0].snippet.channelTitle, ytId: res.data.items[0].id.channelId };
+    if (res.data.items && res.data.items.length > 0) {
+      return {
+        name: res.data.items[0].snippet.channelTitle,
+        ytId: res.data.items[0].id.channelId,
+      };
     }
-  } catch (e) {}
+  } catch (err) {
+    log(`YouTube info error: ${err.message}`, "warn");
+  }
   return { name: handle, ytId: handle };
 }
 
-async function fetchLatestVideos(ytChannelId) {
+// ================================================
+// YOUTUBE — Fetch Latest Videos
+// ================================================
+async function getLatestVideos(ytChannelId) {
   try {
-    const res = await axios.get('https://www.googleapis.com/youtube/v3/search', {
-      params: { part: 'snippet', channelId: ytChannelId, type: 'video', order: 'date', maxResults: 3, key: process.env.YOUTUBE_API_KEY }
+    const res = await axios.get("https://www.googleapis.com/youtube/v3/search", {
+      params: {
+        part: "snippet",
+        channelId: ytChannelId,
+        type: "video",
+        order: "date",
+        maxResults: 3,
+        key: process.env.YOUTUBE_API_KEY,
+      },
     });
     return res.data.items || [];
-  } catch (e) { return []; }
+  } catch (err) {
+    log(`Fetch videos error: ${err.message}`, "warn");
+    return [];
+  }
 }
 
-// =============================================
-// AI CLIP ANALYSIS
-// =============================================
-async function analyzeWithClaude(channel, videoTitle, videoId) {
-  const prompt = `You are a viral content expert. Analyze this YouTube video and suggest 2 clip moments perfect for TikTok/Shorts.
+// ================================================
+// CLAUDE AI — Analyze Video & Suggest Clips
+// ================================================
+async function analyzeWithClaude(channel, videoTitle) {
+  const prompt = `You are a viral short-form content expert.
 
-Channel: "${channel.name}"
-Video Title: "${videoTitle}"
+A YouTube channel called "${channel.name}" just uploaded a video titled: "${videoTitle}"
 Target clip length: ${channel.clipLength} seconds
 
-Respond in JSON only — no markdown, no explanation:
+Suggest the 2 best clip moments for TikTok, Instagram Reels, and YouTube Shorts.
+
+Respond ONLY in raw JSON with no markdown or explanation:
 {
   "clips": [
     {
-      "title": "Viral clip title",
-      "startTime": "00:30",
-      "endTime": "01:30",
-      "viralScore": 87,
+      "title": "Short punchy clip title",
+      "startTime": "00:45",
+      "endTime": "01:45",
+      "viralScore": 91,
       "reason": "Why this moment is viral",
-      "caption": "Engaging TikTok caption with hashtags #fyp #viral"
+      "caption": "Engaging caption with hashtags #fyp #viral #shorts"
+    },
+    {
+      "title": "Second clip title",
+      "startTime": "05:10",
+      "endTime": "06:10",
+      "viralScore": 83,
+      "reason": "Why this moment is viral",
+      "caption": "Another caption #trending #creator"
     }
   ]
 }`;
 
   try {
-    const res = await axios.post('https://api.anthropic.com/v1/messages', {
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 1000,
-      messages: [{ role: 'user', content: prompt }]
-    }, {
-      headers: { 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json' }
-    });
+    const res = await axios.post(
+      "https://api.anthropic.com/v1/messages",
+      {
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 1000,
+        messages: [{ role: "user", content: prompt }],
+      },
+      {
+        headers: {
+          "x-api-key": process.env.ANTHROPIC_API_KEY,
+          "anthropic-version": "2023-06-01",
+          "Content-Type": "application/json",
+        },
+      }
+    );
 
-    const text = res.data.content?.[0]?.text || '{}';
-    const clean = text.replace(/```json|```/g, '').trim();
-    return JSON.parse(clean);
-  } catch (e) {
-    addLog(`AI analysis error: ${e.message}`, 'warn');
-    return { clips: [] };
+    const raw = res.data.content?.[0]?.text || "{}";
+    const clean = raw.replace(/```json|```/g, "").trim();
+    const parsed = JSON.parse(clean);
+    return parsed.clips || [];
+  } catch (err) {
+    log(`Claude AI error: ${err.message}`, "warn");
+    return [];
   }
 }
 
-// =============================================
-// SCAN CHANNEL
-// =============================================
+// ================================================
+// SCAN CHANNEL — Detect new videos and clip them
+// ================================================
 async function scanChannel(channel) {
-  addLog(`Scanning channel: ${channel.name}`, 'info');
-  channel.status = 'processing';
+  log(`Scanning: ${channel.name}`, "info");
+  channel.status = "processing";
   channel.lastScanned = new Date().toISOString();
 
   try {
-    const videos = await fetchLatestVideos(channel.ytId);
+    const videos = await getLatestVideos(channel.ytId);
 
-    if (videos.length > 0) {
-      for (const video of videos.slice(0, 2)) {
-        const videoId = video.id.videoId;
-        const title = video.snippet.title;
-        const alreadyClipped = clips.find(c => c.videoId === videoId);
-        if (alreadyClipped) continue;
+    if (videos.length === 0) {
+      log(`No videos found for: ${channel.name}`, "info");
+      channel.status = "active";
+      return;
+    }
 
-        addLog(`Analyzing video: ${title}`, 'info');
-        const aiResult = await analyzeWithClaude(channel, title, videoId);
+    for (const video of videos.slice(0, 2)) {
+      const videoId = video.id?.videoId;
+      const title = video.snippet?.title;
+      if (!videoId || !title) continue;
 
-        for (const clip of (aiResult.clips || [])) {
-          const clipObj = {
-            id: Date.now().toString() + Math.random().toString(36).slice(2),
-            channelId: channel.id,
-            channelName: channel.name,
-            videoId, videoTitle: title,
-            clipTitle: clip.title,
-            startTime: clip.startTime,
-            endTime: clip.endTime,
-            duration: channel.clipLength + 's',
-            viralScore: clip.viralScore,
-            reason: clip.reason,
-            caption: clip.caption,
-            status: channel.autoPost ? 'queued' : 'ready',
-            createdAt: new Date().toISOString()
-          };
-          clips.unshift(clipObj);
-          channel.clipsGenerated++;
-          addLog(`Clip created: "${clip.title}" (Score: ${clip.viralScore}%)`, 'success');
+      // Skip already clipped videos
+      if (clips.find((c) => c.videoId === videoId)) {
+        log(`Already clipped: ${title}`, "info");
+        continue;
+      }
 
-          if (channel.autoPost) {
-            await postClip(clipObj, channel);
-          }
+      log(`AI analyzing: ${title}`, "info");
+      const suggestions = await analyzeWithClaude(channel, title);
+
+      for (const s of suggestions) {
+        const clip = {
+          id: Date.now().toString() + Math.random().toString(36).slice(2, 7),
+          channelId: channel.id,
+          channelName: channel.name,
+          videoId,
+          videoTitle: title,
+          clipTitle: s.title,
+          startTime: s.startTime,
+          endTime: s.endTime,
+          duration: channel.clipLength + "s",
+          viralScore: s.viralScore,
+          reason: s.reason,
+          caption: s.caption,
+          status: channel.autoPost ? "queued" : "ready",
+          createdAt: new Date().toISOString(),
+          postedAt: null,
+        };
+
+        clips.unshift(clip);
+        channel.clipsGenerated++;
+        log(`Clip ready: "${s.title}" — Score: ${s.viralScore}%`, "success");
+
+        if (channel.autoPost) {
+          await postClip(clip, channel);
         }
       }
-    } else {
-      addLog(`No new videos found for ${channel.name}`, 'info');
     }
-  } catch (e) {
-    addLog(`Scan error for ${channel.name}: ${e.message}`, 'warn');
+  } catch (err) {
+    log(`Scan error for ${channel.name}: ${err.message}`, "error");
   }
 
-  channel.status = 'active';
+  channel.status = "active";
 }
 
-// =============================================
-// POST CLIP TO PLATFORMS
-// =============================================
+// ================================================
+// POST CLIP — Distribute to platforms
+// ================================================
 async function postClip(clip, channel) {
   if (!channel) return;
-  addLog(`Posting clip: "${clip.clipTitle}"`, 'info');
+  log(`Posting: "${clip.clipTitle}"`, "info");
 
-  // Post to Instagram Reels
-  if (channel.postTo === 'all' || channel.postTo === 'instagram') {
+  if (channel.postTo === "all" || channel.postTo === "instagram") {
     await postToInstagram(clip);
   }
 
-  clip.status = 'posted';
+  // TikTok — enabled once API approved
+  // if (channel.postTo === "all" || channel.postTo === "tiktok") {
+  //   await postToTikTok(clip);
+  // }
+
+  clip.status = "posted";
   clip.postedAt = new Date().toISOString();
   channel.postsPublished++;
-  addLog(`Posted successfully: "${clip.clipTitle}"`, 'success');
+  log(`Posted: "${clip.clipTitle}"`, "success");
 }
 
+// ================================================
+// INSTAGRAM — Publish Reel
+// ================================================
 async function postToInstagram(clip) {
   try {
-    const createRes = await axios.post(
-      `https://graph.facebook.com/v25.0/${process.env.INSTAGRAM_PAGE_ID}/media`,
+    const pageId = process.env.INSTAGRAM_PAGE_ID;
+    const token = process.env.INSTAGRAM_ACCESS_TOKEN;
+
+    const create = await axios.post(
+      `https://graph.facebook.com/v25.0/${pageId}/media`,
       {
-        media_type: 'REELS',
+        media_type: "REELS",
         caption: clip.caption,
-        access_token: process.env.INSTAGRAM_ACCESS_TOKEN
+        access_token: token,
       }
     );
-    if (createRes.data.id) {
+
+    if (create.data.id) {
       await axios.post(
-        `https://graph.facebook.com/v25.0/${process.env.INSTAGRAM_PAGE_ID}/media_publish`,
-        { creation_id: createRes.data.id, access_token: process.env.INSTAGRAM_ACCESS_TOKEN }
+        `https://graph.facebook.com/v25.0/${pageId}/media_publish`,
+        {
+          creation_id: create.data.id,
+          access_token: token,
+        }
       );
-      addLog(`Instagram Reel published: "${clip.clipTitle}"`, 'success');
+      log(`Instagram Reel posted: "${clip.clipTitle}"`, "success");
     }
-  } catch (e) {
-    addLog(`Instagram error: ${e.message}`, 'warn');
+  } catch (err) {
+    log(`Instagram error: ${err.response?.data?.error?.message || err.message}`, "warn");
   }
 }
 
-// =============================================
-// AUTO-SCAN CRON — every 5 minutes
-// =============================================
-cron.schedule('*/5 * * * *', async () => {
-  const active = channels.filter(c => c.status === 'active');
-  if (active.length > 0) {
-    addLog(`Auto-scan: checking ${active.length} channel(s)`, 'info');
-    for (const ch of active) {
-      await scanChannel(ch);
-    }
+// ================================================
+// AUTO SCAN — Every 5 minutes
+// ================================================
+cron.schedule("*/5 * * * *", async () => {
+  const active = channels.filter((c) => c.status === "active");
+  if (active.length === 0) return;
+  log(`Auto-scan triggered: ${active.length} channel(s)`, "info");
+  for (const ch of active) {
+    await scanChannel(ch);
   }
 });
 
-// =============================================
-// START SERVER
-// =============================================
+// ================================================
+// START
+// ================================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  addLog(`ClipAgent backend running on port ${PORT}`, 'success');
-  console.log(`ClipAgent server started on port ${PORT}`);
+  log(`ClipAgent running on port ${PORT}`, "success");
+  console.log(`ClipAgent server started — port ${PORT}`);
 });
-```
-
----
-
-## 🔑 Step 3: Add Your Keys in Railway Variables Tab
-
-In Railway, instead of uploading `.env`, go to your service → **Variables tab** → click **"New Variable"** and add each one:
-
-| Variable Name | Value |
-|---|---|
-| `YOUTUBE_API_KEY` | `AIzaSyBKhMo1epDVM17Xa8DiVoq-JIOFVAXR5O0` |
-| `ANTHROPIC_API_KEY` | `sk-ant-api03-cjtA...` (your full key) |
-| `WHOP_API_KEY` | `apik_NFa5...` (your full key) |
-| `INSTAGRAM_ACCESS_TOKEN` | `EAANkPE...` (your full token) |
-| `INSTAGRAM_PAGE_ID` | `105515848943534` |
-
----
-
-## 📁 Step 4: How to Add Files on Railway
-
-1. In your Railway service click **"Files"** tab
-2. Click **"New File"** → paste `package.json` content → save
-3. Click **"New File"** → paste `server.js` content → save
-4. Click **"Deploy"** — Railway installs everything and starts the server
-
----
-
-## 🌐 Step 5: Get Your Railway URL
-
-Once deployed Railway gives you a URL like:
-```
-https://clipagent-backend-production.up.railway.app
