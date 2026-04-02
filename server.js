@@ -5,7 +5,20 @@ const cron = require("node-cron");
 const cors = require("cors");
 
 const app = express();
-app.use(cors());
+
+app.use(cors({
+  origin: [
+    "https://clipagent.baycreativeservices.pro",
+    "https://baycreativeservices.pro",
+    "http://localhost:3000",
+    "http://localhost:8080"
+  ],
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  credentials: true
+}));
+
+app.options("*", cors());
 app.use(express.json());
 
 // ================================================
