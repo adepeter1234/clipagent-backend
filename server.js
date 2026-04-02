@@ -8,7 +8,7 @@ const path = require("path");
 const { v4: uuidv4 } = require("uuid");
 const cloudinary = require("cloudinary").v2;
 const ffmpeg = require("fluent-ffmpeg");
-const ytdl = require("ytdl-core");
+const ytDlp = require("yt-dlp-exec");
 
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME || "dj4mtzmjk",
@@ -245,33 +245,22 @@ async function analyzeWithClaude(channel, videoTitle) {
 async function downloadYouTubeVideo(videoId) {
   const outputPath = path.join("/tmp", uuidv4() + "_raw.mp4");
   log("Downloading video: " + videoId, "info");
-  return new Promise((resolve, reject) => {
-    try {
-      const videoUrl = "https://www.youtube.com/watch?v=" + videoId;
-      const stream = ytdl(videoUrl, { quality: "lowest", filter: "videoandaudio" });
-      const file = fs.createWriteStream(outputPath);
-      stream.pipe(file);
-      file.on("finish", () => {
-        log("Download complete: " + outputPath, "success");
-        resolve(outputPath);
-      });
-      file.on("error", (err) => {
-        cleanFile(outputPath);
-        reject(err);
-      });
-      stream.on("error", (err) => {
-        cleanFile(outputPath);
-        reject(err);
-      });
-      setTimeout(() => {
-        cleanFile(outputPath);
-        reject(new Error("Download timeout after 120 seconds"));
-      }, 120000);
-    } catch (err) {
-      cleanFile(outputPath);
-      reject(err);
+  try {
+    await ytDlp("https://www.youtube.com/watch?v=" + videoId, {
+      output: outputPath,
+      format: "worst[ext=mp4]/worst",
+      noPlaylist: true,
+      socketTimeout: 30,
+    });
+    if (!fs.existsSync(outputPath)) {
+      throw new Error("Download failed — file not created");
     }
-  });
+    log("Download complete: " + outputPath, "success");
+    return outputPath;
+  } catch (err) {
+    cleanFile(outputPath);
+    throw new Error("Download error: " + err.message);
+  }
 }
 
 // ================================================
