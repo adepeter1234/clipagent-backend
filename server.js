@@ -3,10 +3,21 @@ const express = require("express");
 const axios = require("axios");
 const cron = require("node-cron");
 const cors = require("cors");
+const fs = require("fs");
+const path = require("path");
+const { v4: uuidv4 } = require("uuid");
+const cloudinary = require("cloudinary").v2;
+const ffmpeg = require("fluent-ffmpeg");
+const ytdl = require("ytdl-core");
+
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME || "dj4mtzmjk",
+  api_key: process.env.CLOUDINARY_API_KEY || "196665315695659",
+  api_secret: process.env.CLOUDINARY_API_SECRET || "_ZJp2seaXrHEvizMpC6rVDNTvZ8"
+});
 
 const app = express();
 app.use(cors());
-app.options("*", cors());
 app.use(express.json());
 
 let channels = [];
@@ -15,25 +26,39 @@ let logs = [];
 
 function log(msg, type) {
   if (!type) type = "info";
-  var entry = { time: new Date().toISOString(), msg: msg, type: type };
+  const entry = { time: new Date().toISOString(), msg, type };
   logs.unshift(entry);
   if (logs.length > 200) logs.pop();
   console.log("[" + type.toUpperCase() + "] " + msg);
 }
 
-app.get("/", function(req, res) {
+function cleanFile(filePath) {
+  try {
+    if (filePath && fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+      log("Cleaned up: " + filePath, "info");
+    }
+  } catch (e) {
+    log("Cleanup error: " + e.message, "warn");
+  }
+}
+
+// ================================================
+// HEALTH CHECK
+// ================================================
+app.get("/", (req, res) => {
   res.json({
     name: "ClipAgent Backend",
     status: "running",
     uptime_seconds: Math.floor(process.uptime()),
     channels: channels.length,
     clips: clips.length,
-    posts: clips.filter(function(c) { return c.status === "posted"; }).length
+    posts: clips.filter(c => c.status === "posted").length
   });
 });
 
-app.get("/api/stats", function(req, res) {
-  var posted = clips.filter(function(c) { return c.status === "posted"; }).length;
+app.get("/api/stats", (req, res) => {
+  const posted = clips.filter(c => c.status === "posted").length;
   res.json({
     channels: channels.length,
     clips: clips.length,
@@ -42,46 +67,28 @@ app.get("/api/stats", function(req, res) {
   });
 });
 
-app.get("/api/logs", function(req, res) {
-  res.json(logs.slice(0, 50));
-});
+app.get("/api/logs", (req, res) => res.json(logs.slice(0, 50)));
+app.get("/api/channels", (req, res) => res.json(channels));
+app.get("/api/clips", (req, res) => res.json(clips));
 
-app.get("/api/channels", function(req, res) {
-  res.json(channels);
-});
-
-app.post("/api/channels", async function(req, res) {
+// ================================================
+// CHANNELS — Add
+// ================================================
+app.post("/api/channels", async (req, res) => {
   try {
-    var url = req.body.url;
-    var name = req.body.name;
-    var clipLength = req.body.clipLength || 60;
-    var postTo = req.body.postTo || "all";
-    var autoPost = req.body.autoPost !== undefined ? req.body.autoPost : true;
-
+    const { url, name, clipLength = 60, postTo = "all", autoPost = true } = req.body;
     if (!url) return res.status(400).json({ error: "YouTube channel URL is required" });
     if (channels.length >= 10) return res.status(400).json({ error: "Maximum of 10 channels reached" });
-    if (channels.find(function(c) { return c.url === url; })) {
-      return res.status(400).json({ error: "This channel is already added" });
-    }
-
-    var handle = extractHandle(url);
-    var info = await getYouTubeChannelInfo(handle);
-
-    var channel = {
-      id: Date.now().toString(),
-      url: url,
-      name: name || info.name || handle,
-      ytId: info.ytId || handle,
-      clipLength: parseInt(clipLength),
-      postTo: postTo,
-      autoPost: Boolean(autoPost),
-      status: "active",
-      clipsGenerated: 0,
-      postsPublished: 0,
-      lastScanned: null,
+    if (channels.find(c => c.url === url)) return res.status(400).json({ error: "Channel already added" });
+    const handle = extractHandle(url);
+    const info = await getYouTubeChannelInfo(handle);
+    const channel = {
+      id: Date.now().toString(), url, name: name || info.name || handle,
+      ytId: info.ytId || handle, clipLength: parseInt(clipLength),
+      postTo, autoPost: Boolean(autoPost), status: "active",
+      clipsGenerated: 0, postsPublished: 0, lastScanned: null,
       addedAt: new Date().toISOString()
     };
-
     channels.push(channel);
     log("Channel added: " + channel.name, "success");
     res.json(channel);
@@ -91,39 +98,38 @@ app.post("/api/channels", async function(req, res) {
   }
 });
 
-app.delete("/api/channels/:id", function(req, res) {
-  var ch = channels.find(function(c) { return c.id === req.params.id; });
-  if (!ch) return res.status(404).json({ error: "Channel not found" });
-  channels = channels.filter(function(c) { return c.id !== req.params.id; });
+// ================================================
+// CHANNELS — Delete / Toggle
+// ================================================
+app.delete("/api/channels/:id", (req, res) => {
+  const ch = channels.find(c => c.id === req.params.id);
+  if (!ch) return res.status(404).json({ error: "Not found" });
+  channels = channels.filter(c => c.id !== req.params.id);
   log("Channel removed: " + ch.name, "warn");
   res.json({ success: true });
 });
 
-app.patch("/api/channels/:id/toggle", function(req, res) {
-  var ch = channels.find(function(c) { return c.id === req.params.id; });
-  if (!ch) return res.status(404).json({ error: "Channel not found" });
+app.patch("/api/channels/:id/toggle", (req, res) => {
+  const ch = channels.find(c => c.id === req.params.id);
+  if (!ch) return res.status(404).json({ error: "Not found" });
   ch.status = ch.status === "active" ? "paused" : "active";
   log("Channel " + ch.status + ": " + ch.name, "info");
   res.json(ch);
 });
 
-app.get("/api/clips", function(req, res) {
-  res.json(clips);
-});
-
-app.delete("/api/clips/:id", function(req, res) {
-  var clip = clips.find(function(c) { return c.id === req.params.id; });
-  if (!clip) return res.status(404).json({ error: "Clip not found" });
-  clips = clips.filter(function(c) { return c.id !== req.params.id; });
-  log("Clip deleted: " + clip.clipTitle, "warn");
+// ================================================
+// CLIPS — Delete / Post
+// ================================================
+app.delete("/api/clips/:id", (req, res) => {
+  clips = clips.filter(c => c.id !== req.params.id);
   res.json({ success: true });
 });
 
-app.post("/api/clips/:id/post", async function(req, res) {
+app.post("/api/clips/:id/post", async (req, res) => {
   try {
-    var clip = clips.find(function(c) { return c.id === req.params.id; });
-    if (!clip) return res.status(404).json({ error: "Clip not found" });
-    var ch = channels.find(function(c) { return c.id === clip.channelId; });
+    const clip = clips.find(c => c.id === req.params.id);
+    if (!clip) return res.status(404).json({ error: "Not found" });
+    const ch = channels.find(c => c.id === clip.channelId);
     await postClip(clip, ch);
     res.json({ success: true });
   } catch (err) {
@@ -131,28 +137,32 @@ app.post("/api/clips/:id/post", async function(req, res) {
   }
 });
 
-app.post("/api/scan", async function(req, res) {
+// ================================================
+// SCAN — Manual Trigger
+// ================================================
+app.post("/api/scan", async (req, res) => {
   try {
-    var channelId = req.body.channelId;
+    const { channelId } = req.body;
     if (channelId) {
-      var ch = channels.find(function(c) { return c.id === channelId; });
-      if (!ch) return res.status(404).json({ error: "Channel not found" });
+      const ch = channels.find(c => c.id === channelId);
+      if (!ch) return res.status(404).json({ error: "Not found" });
       await scanChannel(ch);
       return res.json({ success: true, channel: ch.name });
     }
-    var active = channels.filter(function(c) { return c.status === "active"; });
-    for (var i = 0; i < active.length; i++) {
-      await scanChannel(active[i]);
-    }
+    const active = channels.filter(c => c.status === "active");
+    for (const ch of active) await scanChannel(ch);
     res.json({ success: true, scanned: active.length });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-app.post("/api/refresh-token", async function(req, res) {
+// ================================================
+// TOKEN REFRESH
+// ================================================
+app.post("/api/refresh-token", async (req, res) => {
   try {
-    var refreshRes = await axios.get("https://graph.facebook.com/v25.0/oauth/access_token", {
+    const r = await axios.get("https://graph.facebook.com/v25.0/oauth/access_token", {
       params: {
         grant_type: "fb_exchange_token",
         client_id: process.env.FACEBOOK_APP_ID,
@@ -160,40 +170,23 @@ app.post("/api/refresh-token", async function(req, res) {
         fb_exchange_token: process.env.INSTAGRAM_ACCESS_TOKEN
       }
     });
-    if (refreshRes.data.access_token) {
-      process.env.INSTAGRAM_ACCESS_TOKEN = refreshRes.data.access_token;
+    if (r.data.access_token) {
+      process.env.INSTAGRAM_ACCESS_TOKEN = r.data.access_token;
       log("Instagram token refreshed", "success");
-      res.json({ success: true, expires_in: refreshRes.data.expires_in });
+      res.json({ success: true });
     } else {
-      res.status(400).json({ error: "Could not refresh token" });
+      res.status(400).json({ error: "Could not refresh" });
     }
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-app.get("/api/instagram/setup", async function(req, res) {
-  try {
-    var token = process.env.INSTAGRAM_ACCESS_TOKEN;
-    var pageId = process.env.INSTAGRAM_PAGE_ID;
-    var r = await axios.get(
-      "https://graph.facebook.com/v25.0/" + pageId + "?fields=instagram_business_account&access_token=" + token
-    );
-    if (r.data.instagram_business_account) {
-      var igId = r.data.instagram_business_account.id;
-      process.env.INSTAGRAM_BUSINESS_ID = igId;
-      log("Instagram Business ID: " + igId, "success");
-      res.json({ success: true, instagram_business_id: igId });
-    } else {
-      res.json({ success: false, message: "No Instagram Business account linked to this Facebook Page" });
-    }
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
+// ================================================
+// YOUTUBE HELPERS
+// ================================================
 function extractHandle(url) {
-  var m = url.match(/youtube\.com\/@([^\/\?&]+)/) ||
+  const m = url.match(/youtube\.com\/@([^\/\?&]+)/) ||
     url.match(/youtube\.com\/channel\/([^\/\?&]+)/) ||
     url.match(/youtube\.com\/c\/([^\/\?&]+)/) ||
     url.match(/youtube\.com\/user\/([^\/\?&]+)/);
@@ -202,20 +195,11 @@ function extractHandle(url) {
 
 async function getYouTubeChannelInfo(handle) {
   try {
-    var res = await axios.get("https://www.googleapis.com/youtube/v3/search", {
-      params: {
-        part: "snippet",
-        type: "channel",
-        q: handle,
-        maxResults: 1,
-        key: process.env.YOUTUBE_API_KEY
-      }
+    const res = await axios.get("https://www.googleapis.com/youtube/v3/search", {
+      params: { part: "snippet", type: "channel", q: handle, maxResults: 1, key: process.env.YOUTUBE_API_KEY }
     });
     if (res.data.items && res.data.items.length > 0) {
-      return {
-        name: res.data.items[0].snippet.channelTitle,
-        ytId: res.data.items[0].id.channelId
-      };
+      return { name: res.data.items[0].snippet.channelTitle, ytId: res.data.items[0].id.channelId };
     }
   } catch (err) {
     log("YouTube info error: " + err.message, "warn");
@@ -225,15 +209,8 @@ async function getYouTubeChannelInfo(handle) {
 
 async function getLatestVideos(ytChannelId) {
   try {
-    var res = await axios.get("https://www.googleapis.com/youtube/v3/search", {
-      params: {
-        part: "snippet",
-        channelId: ytChannelId,
-        type: "video",
-        order: "date",
-        maxResults: 3,
-        key: process.env.YOUTUBE_API_KEY
-      }
+    const res = await axios.get("https://www.googleapis.com/youtube/v3/search", {
+      params: { part: "snippet", channelId: ytChannelId, type: "video", order: "date", maxResults: 3, key: process.env.YOUTUBE_API_KEY }
     });
     return res.data.items || [];
   } catch (err) {
@@ -242,181 +219,295 @@ async function getLatestVideos(ytChannelId) {
   }
 }
 
+// ================================================
+// CLAUDE AI — Analyze Video
+// ================================================
 async function analyzeWithClaude(channel, videoTitle) {
-  var prompt = "You are a viral short-form content expert.\n\n" +
-    "Channel: \"" + channel.name + "\"\n" +
-    "Video Title: \"" + videoTitle + "\"\n" +
-    "Target clip length: " + channel.clipLength + " seconds\n\n" +
-    "Suggest the 2 best clip moments for TikTok, Instagram Reels, and YouTube Shorts.\n\n" +
-    "Respond ONLY in raw JSON with no markdown:\n" +
-    "{\"clips\":[{\"title\":\"clip title\",\"startTime\":\"00:45\",\"endTime\":\"01:45\",\"viralScore\":91,\"reason\":\"why viral\",\"caption\":\"caption #fyp #viral\"}]}";
-
+  const prompt = "You are a viral content expert.\nChannel: \"" + channel.name + "\"\nVideo: \"" + videoTitle + "\"\nClip length: " + channel.clipLength + "s\n\nSuggest 2 clip moments. Respond ONLY in raw JSON no markdown:\n{\"clips\":[{\"title\":\"title\",\"startTime\":\"00:30\",\"endTime\":\"01:30\",\"startSeconds\":30,\"viralScore\":90,\"reason\":\"reason\",\"caption\":\"caption #fyp #viral #shorts\"}]}";
   try {
-    var res = await axios.post(
+    const res = await axios.post(
       "https://api.anthropic.com/v1/messages",
-      {
-        model: "claude-sonnet-4-20250514",
-        max_tokens: 1000,
-        messages: [{ role: "user", content: prompt }]
-      },
-      {
-        headers: {
-          "x-api-key": process.env.ANTHROPIC_API_KEY,
-          "anthropic-version": "2023-06-01",
-          "Content-Type": "application/json"
-        }
-      }
+      { model: "claude-sonnet-4-20250514", max_tokens: 1000, messages: [{ role: "user", content: prompt }] },
+      { headers: { "x-api-key": process.env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "Content-Type": "application/json" } }
     );
-    var raw = (res.data.content && res.data.content[0]) ? res.data.content[0].text : "{}";
-    var clean = raw.replace(/```json|```/g, "").trim();
-    var parsed = JSON.parse(clean);
+    const raw = res.data.content && res.data.content[0] ? res.data.content[0].text : "{}";
+    const parsed = JSON.parse(raw.replace(/```json|```/g, "").trim());
     return parsed.clips || [];
   } catch (err) {
-    log("Claude AI error: " + err.message, "warn");
+    log("Claude error: " + err.message, "warn");
     return [];
   }
 }
 
+// ================================================
+// STEP 1 — DOWNLOAD YOUTUBE VIDEO
+// ================================================
+async function downloadYouTubeVideo(videoId) {
+  const outputPath = path.join("/tmp", uuidv4() + "_raw.mp4");
+  log("Downloading video: " + videoId, "info");
+  return new Promise((resolve, reject) => {
+    try {
+      const videoUrl = "https://www.youtube.com/watch?v=" + videoId;
+      const stream = ytdl(videoUrl, { quality: "lowest", filter: "videoandaudio" });
+      const file = fs.createWriteStream(outputPath);
+      stream.pipe(file);
+      file.on("finish", () => {
+        log("Download complete: " + outputPath, "success");
+        resolve(outputPath);
+      });
+      file.on("error", (err) => {
+        cleanFile(outputPath);
+        reject(err);
+      });
+      stream.on("error", (err) => {
+        cleanFile(outputPath);
+        reject(err);
+      });
+      setTimeout(() => {
+        cleanFile(outputPath);
+        reject(new Error("Download timeout after 120 seconds"));
+      }, 120000);
+    } catch (err) {
+      cleanFile(outputPath);
+      reject(err);
+    }
+  });
+}
+
+// ================================================
+// STEP 2 — CUT CLIP WITH FFMPEG
+// ================================================
+async function cutVideoClip(inputPath, startSeconds, duration) {
+  const outputPath = path.join("/tmp", uuidv4() + "_clip.mp4");
+  const start = startSeconds || 0;
+  const clipDuration = duration || 30;
+  log("Cutting clip: start=" + start + "s duration=" + clipDuration + "s", "info");
+  return new Promise((resolve, reject) => {
+    ffmpeg(inputPath)
+      .setStartTime(start)
+      .setDuration(clipDuration)
+      .videoCodec("libx264")
+      .audioCodec("aac")
+      .outputOptions([
+        "-preset ultrafast",
+        "-crf 28",
+        "-vf scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2",
+        "-movflags +faststart",
+        "-pix_fmt yuv420p"
+      ])
+      .output(outputPath)
+      .on("end", () => {
+        log("Clip ready: " + outputPath, "success");
+        resolve(outputPath);
+      })
+      .on("error", (err) => {
+        cleanFile(outputPath);
+        reject(new Error("FFmpeg error: " + err.message));
+      })
+      .run();
+    setTimeout(() => {
+      cleanFile(outputPath);
+      reject(new Error("FFmpeg timeout after 180 seconds"));
+    }, 180000);
+  });
+}
+
+// ================================================
+// STEP 3 — UPLOAD TO CLOUDINARY
+// ================================================
+async function uploadToCloudinary(filePath, clipTitle) {
+  log("Uploading to Cloudinary: " + clipTitle, "info");
+  return new Promise((resolve, reject) => {
+    cloudinary.uploader.upload(filePath,
+      {
+        resource_type: "video",
+        public_id: "clipagent_" + Date.now(),
+        folder: "clipagent",
+        overwrite: true
+      },
+      (error, result) => {
+        if (error) {
+          reject(new Error("Cloudinary upload error: " + error.message));
+        } else {
+          log("Cloudinary upload done: " + result.secure_url, "success");
+          resolve(result.secure_url);
+        }
+      }
+    );
+  });
+}
+
+// ================================================
+// STEP 4 — POST TO INSTAGRAM AS REEL
+// ================================================
+async function postToInstagram(clip) {
+  let rawVideoPath = null;
+  let clippedVideoPath = null;
+
+  try {
+    const igId = process.env.INSTAGRAM_BUSINESS_ID || process.env.INSTAGRAM_PAGE_ID;
+    const token = process.env.INSTAGRAM_ACCESS_TOKEN;
+
+    if (!clip.videoId || clip.videoId === "demo") {
+      log("Skipping Instagram — no valid video ID for: " + clip.clipTitle, "info");
+      return false;
+    }
+
+    // STEP 1 — Download
+    rawVideoPath = await downloadYouTubeVideo(clip.videoId);
+
+    // STEP 2 — Cut clip
+    const startSeconds = clip.startSeconds || 0;
+    const duration = clip.clipLength || 30;
+    clippedVideoPath = await cutVideoClip(rawVideoPath, startSeconds, duration);
+
+    // STEP 3 — Upload to Cloudinary
+    const videoUrl = await uploadToCloudinary(clippedVideoPath, clip.clipTitle);
+
+    // STEP 4 — Post to Instagram as Reel
+    log("Posting Reel to Instagram: " + clip.clipTitle, "info");
+    const caption = clip.caption + "\n\n" + clip.clipTitle;
+
+    const createRes = await axios.post(
+      "https://graph.facebook.com/v25.0/" + igId + "/media",
+      { media_type: "REELS", video_url: videoUrl, caption: caption, access_token: token }
+    );
+
+    if (!createRes.data.id) {
+      throw new Error("Failed to create Instagram media container");
+    }
+
+    const containerId = createRes.data.id;
+    log("Instagram container created: " + containerId, "info");
+
+    // Wait for Instagram to process video (poll up to 90 seconds)
+    let ready = false;
+    for (let i = 0; i < 18; i++) {
+      await new Promise(r => setTimeout(r, 5000));
+      try {
+        const statusRes = await axios.get(
+          "https://graph.facebook.com/v25.0/" + containerId + "?fields=status_code&access_token=" + token
+        );
+        log("Instagram status: " + statusRes.data.status_code, "info");
+        if (statusRes.data.status_code === "FINISHED") { ready = true; break; }
+        if (statusRes.data.status_code === "ERROR") { throw new Error("Instagram video processing failed"); }
+      } catch (pollErr) {
+        log("Poll error: " + pollErr.message, "warn");
+      }
+    }
+
+    if (!ready) {
+      throw new Error("Instagram video processing timed out");
+    }
+
+    // Publish
+    const publishRes = await axios.post(
+      "https://graph.facebook.com/v25.0/" + igId + "/media_publish",
+      { creation_id: containerId, access_token: token }
+    );
+
+    if (publishRes.data.id) {
+      log("Instagram Reel published: " + clip.clipTitle + " ID: " + publishRes.data.id, "success");
+      return true;
+    }
+
+  } catch (err) {
+    const msg = err.response && err.response.data && err.response.data.error
+      ? err.response.data.error.message
+      : err.message;
+    log("Instagram error: " + msg, "warn");
+    return false;
+  } finally {
+    cleanFile(rawVideoPath);
+    cleanFile(clippedVideoPath);
+  }
+}
+
+// ================================================
+// SCAN CHANNEL
+// ================================================
 async function scanChannel(channel) {
   log("Scanning: " + channel.name, "info");
   channel.status = "processing";
   channel.lastScanned = new Date().toISOString();
-
   try {
-    var videos = await getLatestVideos(channel.ytId);
-
-    if (videos.length === 0) {
-      log("No videos found for: " + channel.name, "info");
+    const videos = await getLatestVideos(channel.ytId);
+    if (!videos.length) {
+      log("No videos found: " + channel.name, "info");
       channel.status = "active";
       return;
     }
-
-    for (var v = 0; v < Math.min(videos.length, 2); v++) {
-      var video = videos[v];
-      var videoId = video.id && video.id.videoId;
-      var title = video.snippet && video.snippet.title;
+    for (const video of videos.slice(0, 2)) {
+      const videoId = video.id && video.id.videoId;
+      const title = video.snippet && video.snippet.title;
       if (!videoId || !title) continue;
-
-      var alreadyClipped = clips.find(function(c) { return c.videoId === videoId; });
-      if (alreadyClipped) {
+      if (clips.find(c => c.videoId === videoId)) {
         log("Already clipped: " + title, "info");
         continue;
       }
-
       log("AI analyzing: " + title, "info");
-      var suggestions = await analyzeWithClaude(channel, title);
-
-      for (var s = 0; s < suggestions.length; s++) {
-        var suggestion = suggestions[s];
-        var clip = {
+      const suggestions = await analyzeWithClaude(channel, title);
+      for (const s of suggestions) {
+        const clip = {
           id: Date.now().toString() + Math.random().toString(36).slice(2, 7),
-          channelId: channel.id,
-          channelName: channel.name,
-          videoId: videoId,
-          videoTitle: title,
-          clipTitle: suggestion.title,
-          startTime: suggestion.startTime,
-          endTime: suggestion.endTime,
+          channelId: channel.id, channelName: channel.name,
+          videoId, videoTitle: title, clipTitle: s.title,
+          startTime: s.startTime, endTime: s.endTime,
+          startSeconds: s.startSeconds || 0,
+          clipLength: channel.clipLength,
           duration: channel.clipLength + "s",
-          viralScore: suggestion.viralScore,
-          reason: suggestion.reason,
-          caption: suggestion.caption,
+          viralScore: s.viralScore, reason: s.reason, caption: s.caption,
           status: channel.autoPost ? "queued" : "ready",
-          createdAt: new Date().toISOString(),
-          postedAt: null
+          createdAt: new Date().toISOString(), postedAt: null
         };
-
         clips.unshift(clip);
         channel.clipsGenerated++;
-        log("Clip ready: \"" + suggestion.title + "\" Score: " + suggestion.viralScore + "%", "success");
-
-        if (channel.autoPost) {
-          await postClip(clip, channel);
-        }
+        log("Clip ready: " + s.title + " Score: " + s.viralScore + "%", "success");
+        if (channel.autoPost) await postClip(clip, channel);
       }
     }
   } catch (err) {
-    log("Scan error for " + channel.name + ": " + err.message, "error");
+    log("Scan error: " + err.message, "error");
   }
-
   channel.status = "active";
 }
 
+// ================================================
+// POST CLIP
+// ================================================
 async function postClip(clip, channel) {
   if (!channel) return;
-  log("Posting: \"" + clip.clipTitle + "\"", "info");
-
-  if (channel.postTo === "all" || channel.postTo === "instagram") {
-    await postToInstagram(clip);
-  }
-
-  clip.status = "posted";
-  clip.postedAt = new Date().toISOString();
-  channel.postsPublished++;
-  log("Posted: \"" + clip.clipTitle + "\"", "success");
-}
-
-async function postToInstagram(clip) {
+  log("Posting: " + clip.clipTitle, "info");
   try {
-    var igId = process.env.INSTAGRAM_BUSINESS_ID || process.env.INSTAGRAM_PAGE_ID;
-    var token = process.env.INSTAGRAM_ACCESS_TOKEN;
-
-    var thumbUrl = (clip.videoId && clip.videoId !== "demo")
-      ? "https://img.youtube.com/vi/" + clip.videoId + "/maxresdefault.jpg"
-      : null;
-
-    if (!thumbUrl) {
-      log("Instagram skip — no thumbnail for: " + clip.clipTitle, "info");
-      return false;
+    if (channel.postTo === "all" || channel.postTo === "instagram") {
+      await postToInstagram(clip);
     }
-
-    var caption = clip.caption + "\n\nClip: " + clip.clipTitle + "\nScore: " + clip.viralScore + "%";
-
-    var create = await axios.post(
-      "https://graph.facebook.com/v25.0/" + igId + "/media",
-      {
-        image_url: thumbUrl,
-        caption: caption,
-        access_token: token
-      }
-    );
-
-    if (create.data.id) {
-      await new Promise(function(r) { setTimeout(r, 3000); });
-      var publish = await axios.post(
-        "https://graph.facebook.com/v25.0/" + igId + "/media_publish",
-        {
-          creation_id: create.data.id,
-          access_token: token
-        }
-      );
-      if (publish.data.id) {
-        log("Instagram post published: \"" + clip.clipTitle + "\"", "success");
-        return true;
-      }
-    }
+    clip.status = "posted";
+    clip.postedAt = new Date().toISOString();
+    channel.postsPublished++;
+    log("Posted: " + clip.clipTitle, "success");
   } catch (err) {
-    var errMsg = (err.response && err.response.data && err.response.data.error)
-      ? err.response.data.error.message
-      : err.message;
-    log("Instagram error: " + errMsg, "warn");
-    return false;
+    log("Post error: " + err.message, "warn");
+    clip.status = "failed";
   }
 }
 
-cron.schedule("*/5 * * * *", async function() {
-  var active = channels.filter(function(c) { return c.status === "active"; });
-  if (active.length === 0) return;
+// ================================================
+// AUTO SCAN — Every 5 minutes
+// ================================================
+cron.schedule("*/5 * * * *", async () => {
+  const active = channels.filter(c => c.status === "active");
+  if (!active.length) return;
   log("Auto-scan: " + active.length + " channel(s)", "info");
-  for (var i = 0; i < active.length; i++) {
-    await scanChannel(active[i]);
-  }
+  for (const ch of active) await scanChannel(ch);
 });
 
-cron.schedule("0 0 */50 * *", async function() {
+// ================================================
+// AUTO REFRESH TOKEN — Every 50 days
+// ================================================
+cron.schedule("0 0 */50 * *", async () => {
   try {
-    log("Auto-refreshing Instagram token...", "info");
-    var res = await axios.get("https://graph.facebook.com/v25.0/oauth/access_token", {
+    const r = await axios.get("https://graph.facebook.com/v25.0/oauth/access_token", {
       params: {
         grant_type: "fb_exchange_token",
         client_id: process.env.FACEBOOK_APP_ID,
@@ -424,17 +515,20 @@ cron.schedule("0 0 */50 * *", async function() {
         fb_exchange_token: process.env.INSTAGRAM_ACCESS_TOKEN
       }
     });
-    if (res.data.access_token) {
-      process.env.INSTAGRAM_ACCESS_TOKEN = res.data.access_token;
-      log("Instagram token auto-refreshed", "success");
+    if (r.data.access_token) {
+      process.env.INSTAGRAM_ACCESS_TOKEN = r.data.access_token;
+      log("Token auto-refreshed", "success");
     }
   } catch (err) {
     log("Token refresh error: " + err.message, "warn");
   }
 });
 
-var PORT = process.env.PORT || 3000;
-app.listen(PORT, function() {
+// ================================================
+// START
+// ================================================
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
   log("ClipAgent running on port " + PORT, "success");
-  console.log("ClipAgent server started on port " + PORT);
+  console.log("ClipAgent started on port " + PORT);
 });
