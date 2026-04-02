@@ -386,35 +386,119 @@ async function postClip(clip, channel) {
 
 // ================================================
 // INSTAGRAM — Publish Reel
+// NOTE: Requires a public video URL to post
+// We post as IMAGE with thumbnail if no video URL
+// or queue it for when video is available
 // ================================================
 async function postToInstagram(clip) {
   try {
-    const pageId = process.env.INSTAGRAM_PAGE_ID;
+    const igId = process.env.INSTAGRAM_BUSINESS_ID || process.env.INSTAGRAM_PAGE_ID;
     const token = process.env.INSTAGRAM_ACCESS_TOKEN;
+    const videoUrl = clip.videoUrl || null;
 
-    const create = await axios.post(
-      `https://graph.facebook.com/v25.0/${pageId}/media`,
-      {
-        media_type: "REELS",
-        caption: clip.caption,
-        access_token: token,
+    if (!videoUrl) {
+      // No video URL yet — post as a text/image update instead
+      // using a YouTube thumbnail as the image
+      const thumbUrl = clip.videoId && clip.videoId !== "demo"
+        ? `https://img.youtube.com/vi/${clip.videoId}/maxresdefault.jpg`
+        : null;
+
+      if (thumbUrl) {
+        // Post as IMAGE with clip caption and thumbnail
+        const create = await axios.post(
+          `https://graph.facebook.com/v25.0/${igId}/media`,
+          {
+            image_url: thumbUrl,
+            caption: `${clip.caption}\n\n🎬 New clip: ${clip.clipTitle}\n⏱ ${clip.startTime} - ${clip.endTime}\n🔥 Viral Score: ${clip.viralScore}%`,
+            access_token: token,
+          }
+        );
+
+        if (create.data.id) {
+          // Wait 3 seconds for media to process
+          await new Promise(r => setTimeout(r, 3000));
+
+          const publish = await axios.post(
+            `https://graph.facebook.com/v25.0/${igId}/media_publish`,
+            {
+              creation_id: create.data.id,
+              access_token: token,
+            }
+          );
+
+          if (publish.data.id) {
+            log(`Instagram image post published: "${clip.clipTitle}"`, "success");
+            return true;
+          }
+        }
+      } else {
+        log(`Instagram skip — no video URL or thumbnail for: "${clip.clipTitle}"`, "info");
+        return false;
       }
-    );
-
-    if (create.data.id) {
-      await axios.post(
-        `https://graph.facebook.com/v25.0/${pageId}/media_publish`,
+    } else {
+      // Post as full REEL with video URL
+      const create = await axios.post(
+        `https://graph.facebook.com/v25.0/${igId}/media`,
         {
-          creation_id: create.data.id,
+          media_type: "REELS",
+          video_url: videoUrl,
+          caption: clip.caption,
           access_token: token,
         }
       );
-      log(`Instagram Reel posted: "${clip.clipTitle}"`, "success");
+
+      if (create.data.id) {
+        // Poll until video is processed (up to 60 seconds)
+        let ready = false;
+        for (let i = 0; i < 12; i++) {
+          await new Promise(r => setTimeout(r, 5000));
+          const status = await axios.get(
+            `https://graph.facebook.com/v25.0/${create.data.id}?fields=status_code&access_token=${token}`
+          );
+          if (status.data.status_code === "FINISHED") { ready = true; break; }
+          if (status.data.status_code === "ERROR") { break; }
+        }
+
+        if (ready) {
+          await axios.post(
+            `https://graph.facebook.com/v25.0/${igId}/media_publish`,
+            { creation_id: create.data.id, access_token: token }
+          );
+          log(`Instagram Reel posted: "${clip.clipTitle}"`, "success");
+          return true;
+        }
+      }
     }
   } catch (err) {
     log(`Instagram error: ${err.response?.data?.error?.message || err.message}`, "warn");
+    return false;
   }
 }
+
+// ================================================
+// GET INSTAGRAM BUSINESS ACCOUNT ID
+// ================================================
+app.get("/api/instagram/setup", async (req, res) => {
+  try {
+    const token = process.env.INSTAGRAM_ACCESS_TOKEN;
+    const pageId = process.env.INSTAGRAM_PAGE_ID;
+
+    const r = await axios.get(
+      `https://graph.facebook.com/v25.0/${pageId}?fields=instagram_business_account&access_token=${token}`
+    );
+
+    if (r.data.instagram_business_account) {
+      const igId = r.data.instagram_business_account.id;
+      process.env.INSTAGRAM_BUSINESS_ID = igId;
+      log(`Instagram Business ID found: ${igId}`, "success");
+      res.json({ success: true, instagram_business_id: igId, message: "Add this as INSTAGRAM_BUSINESS_ID in Railway variables" });
+    } else {
+      res.json({ success: false, message: "No Instagram Business account linked to this Facebook Page. Please connect Instagram to your Meow Moods Facebook page first." });
+    }
+  } catch (err) {
+    res.status(500).json({ error: err.response?.data?.error?.message || err.message });
+  }
+});
 
 // ================================================
 // AUTO SCAN — Every 5 minutes
@@ -425,6 +509,55 @@ cron.schedule("*/5 * * * *", async () => {
   log(`Auto-scan triggered: ${active.length} channel(s)`, "info");
   for (const ch of active) {
     await scanChannel(ch);
+  }
+});
+
+// ================================================
+// AUTO REFRESH INSTAGRAM TOKEN — Every 50 days
+// ================================================
+cron.schedule("0 0 */50 * *", async () => {
+  try {
+    log("Refreshing Instagram access token...", "info");
+    const res = await axios.get("https://graph.facebook.com/v25.0/oauth/access_token", {
+      params: {
+        grant_type: "fb_exchange_token",
+        client_id: process.env.FACEBOOK_APP_ID,
+        client_secret: process.env.FACEBOOK_APP_SECRET,
+        fb_exchange_token: process.env.INSTAGRAM_ACCESS_TOKEN,
+      },
+    });
+    if (res.data.access_token) {
+      process.env.INSTAGRAM_ACCESS_TOKEN = res.data.access_token;
+      log("Instagram token auto-refreshed successfully ✅", "success");
+    }
+  } catch (err) {
+    log(`Instagram token refresh error: ${err.message}`, "warn");
+  }
+});
+
+// ================================================
+// MANUAL TOKEN REFRESH ENDPOINT
+// ================================================
+app.post("/api/refresh-token", async (req, res) => {
+  try {
+    const refreshRes = await axios.get("https://graph.facebook.com/v25.0/oauth/access_token", {
+      params: {
+        grant_type: "fb_exchange_token",
+        client_id: process.env.FACEBOOK_APP_ID,
+        client_secret: process.env.FACEBOOK_APP_SECRET,
+        fb_exchange_token: process.env.INSTAGRAM_ACCESS_TOKEN,
+      },
+    });
+    if (refreshRes.data.access_token) {
+      process.env.INSTAGRAM_ACCESS_TOKEN = refreshRes.data.access_token;
+      log("Instagram token manually refreshed ✅", "success");
+      res.json({ success: true, expires_in: refreshRes.data.expires_in });
+    } else {
+      res.status(400).json({ error: "Could not refresh token" });
+    }
+  } catch (err) {
+    log(`Manual token refresh error: ${err.message}`, "warn");
+    res.status(500).json({ error: err.message });
   }
 });
 
