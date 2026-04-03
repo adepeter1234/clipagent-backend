@@ -144,110 +144,73 @@ async function analyzeWithClaude(channel, videoTitle) {
 }
 
 // ================================================
-// DOWNLOAD VIA RAPIDAPI — with retry + rate-limit queue
+// DOWNLOAD VIA yt-dlp — reliable, no RapidAPI needed
 // ================================================
+const { execFile, exec } = require("child_process");
 
-// Serialise all RapidAPI calls so concurrent scans never stack up
-let rapidApiQueue = Promise.resolve();
-let lastRapidApiCall = 0;
-const RAPIDAPI_MIN_GAP_MS = 3000; // at least 3 s between calls
-
-function withRapidApiQueue(fn) {
-  rapidApiQueue = rapidApiQueue.then(async () => {
-    const gap = Date.now() - lastRapidApiCall;
-    if (gap < RAPIDAPI_MIN_GAP_MS) {
-      await new Promise(r => setTimeout(r, RAPIDAPI_MIN_GAP_MS - gap));
-    }
-    lastRapidApiCall = Date.now();
-    return fn();
-  });
-  return rapidApiQueue;
-}
-
-async function fetchRapidApiWithRetry(videoId, maxRetries) {
-  if (maxRetries === undefined) maxRetries = 4;
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    try {
-      const response = await axios.get("https://youtube-video-download-info.p.rapidapi.com/dl", {
-        params: { id: videoId },
-        headers: {
-          "x-rapidapi-host": "youtube-video-download-info.p.rapidapi.com",
-          "x-rapidapi-key": process.env.RAPIDAPI_KEY
-        },
-        timeout: 20000
-      });
-      return response.data;
-    } catch (err) {
-      const status = err.response && err.response.status;
-      const is429 = status === 429;
-      const is403 = status === 403;
-      const is5xx = status >= 500;
-
-      if ((is429 || is403 || is5xx) && attempt < maxRetries) {
-        // Exponential backoff: 5s, 15s, 45s
-        const delay = Math.min(5000 * Math.pow(3, attempt - 1), 60000);
-        log("RapidAPI " + status + " on attempt " + attempt + "/" + maxRetries + " — retrying in " + (delay / 1000) + "s", "warn");
-        await new Promise(r => setTimeout(r, delay));
-        lastRapidApiCall = Date.now(); // reset gap timer after a wait
-      } else {
-        throw err;
-      }
-    }
-  }
-}
-
-async function downloadVideoViaRapidAPI(videoId) {
-  const outputPath = path.join("/tmp", uuidv4() + "_raw.mp4");
-  log("Fetching video URL via RapidAPI: " + videoId, "info");
-
-  return withRapidApiQueue(async () => {
-    try {
-      const data = await fetchRapidApiWithRetry(videoId);
-
-      const formats = data && data.link;
-      if (!formats || formats.length === 0) throw new Error("No downloadable formats found");
-
-      // Pick best mp4: must have a URL (index 1), be mp4 (index 2), have audio (index 3 truthy)
-      // Sort by quality ascending so we grab smallest file that still has audio
-      const mp4sWithAudio = formats.filter(f => f[1] && f[2] === "mp4" && f[3]);
-      const mp4sAny      = formats.filter(f => f[1] && f[2] === "mp4");
-      const fallback     = formats.filter(f => f[1]);
-
-      const chosen = mp4sWithAudio[0] || mp4sAny[0] || fallback[0];
-      if (!chosen) throw new Error("No usable format found in RapidAPI response");
-
-      const videoUrl = chosen[1];
-      log("Downloading format: " + (chosen[2] || "?") + " audio=" + !!chosen[3] + " url=" + videoUrl.slice(0, 70) + "...", "info");
-
-      const writer = fs.createWriteStream(outputPath);
-      // Must send browser-like headers — YouTube CDN returns 403 to bare axios requests
-      const dlRes = await axios({
-        url: videoUrl,
-        method: "GET",
-        responseType: "stream",
-        timeout: 120000,
-        headers: {
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-          "Referer": "https://www.youtube.com/",
-          "Origin": "https://www.youtube.com",
-          "Accept": "*/*",
-          "Accept-Language": "en-US,en;q=0.9",
-          "Range": "bytes=0-"
+// Ensure yt-dlp is installed at startup
+function ensureYtDlp() {
+  return new Promise((resolve) => {
+    exec("which yt-dlp", (err) => {
+      if (!err) { log("yt-dlp already installed", "info"); return resolve(); }
+      log("Installing yt-dlp...", "info");
+      exec("pip install yt-dlp --break-system-packages --quiet || pip3 install yt-dlp --quiet", (err2) => {
+        if (err2) {
+          // Try curl install as fallback (works on Railway/most Linux)
+          exec("curl -sL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp && chmod a+rx /usr/local/bin/yt-dlp", (err3) => {
+            if (err3) log("yt-dlp install failed — downloads will not work: " + err3.message, "error");
+            else log("yt-dlp installed via curl", "success");
+            resolve();
+          });
+        } else {
+          log("yt-dlp installed via pip", "success");
+          resolve();
         }
       });
-      dlRes.data.pipe(writer);
+    });
+  });
+}
+ensureYtDlp();
 
-      return new Promise((resolve, reject) => {
-        writer.on("finish", () => { log("Download complete: " + outputPath, "success"); resolve(outputPath); });
-        writer.on("error", (err) => { cleanFile(outputPath); reject(err); });
-      });
-    } catch (err) {
+async function downloadVideoViaRapidAPI(videoId) {
+  // Name kept for backward compat — now uses yt-dlp instead of RapidAPI
+  const outputPath = path.join("/tmp", uuidv4() + "_raw.mp4");
+  const videoUrl = "https://www.youtube.com/watch?v=" + videoId;
+  log("Downloading via yt-dlp: " + videoId, "info");
+
+  return new Promise((resolve, reject) => {
+    const args = [
+      "--no-playlist",
+      "-f", "bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4][height<=720]/best[height<=720]",
+      "--merge-output-format", "mp4",
+      "--no-warnings",
+      "--quiet",
+      "-o", outputPath,
+      videoUrl
+    ];
+
+    const timeout = setTimeout(() => {
       cleanFile(outputPath);
-      const status = err.response && err.response.status;
-      if (status === 429) throw new Error("RapidAPI rate limit exceeded after all retries — try again in a few minutes");
-      if (status === 403) throw new Error("CDN blocked the download (403) — YouTube signed URL may have expired, will retry next scan");
-      throw new Error("RapidAPI download error: " + err.message);
-    }
+      reject(new Error("yt-dlp download timed out after 3 minutes"));
+    }, 180000);
+
+    execFile("yt-dlp", args, (err, stdout, stderr) => {
+      clearTimeout(timeout);
+      if (err) {
+        cleanFile(outputPath);
+        const msg = stderr || err.message;
+        if (msg.includes("Sign in") || msg.includes("bot") || msg.includes("429")) {
+          return reject(new Error("YouTube is rate-limiting downloads — try again in 10 minutes"));
+        }
+        return reject(new Error("yt-dlp error: " + msg.trim().split("\n").pop()));
+      }
+      if (!fs.existsSync(outputPath) || fs.statSync(outputPath).size === 0) {
+        cleanFile(outputPath);
+        return reject(new Error("yt-dlp finished but output file is missing or empty"));
+      }
+      log("Download complete: " + outputPath, "success");
+      resolve(outputPath);
+    });
   });
 }
 
