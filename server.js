@@ -8,7 +8,6 @@ const path = require("path");
 const { v4: uuidv4 } = require("uuid");
 const cloudinary = require("cloudinary").v2;
 const ffmpeg = require("fluent-ffmpeg");
-const ytdl = require("@distube/ytdl-core");
 
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME || "dj4mtzmjk",
@@ -33,25 +32,11 @@ function log(msg, type) {
 }
 
 function cleanFile(filePath) {
-  try {
-    if (filePath && fs.existsSync(filePath)) {
-      fs.unlinkSync(filePath);
-      log("Cleaned up: " + filePath, "info");
-    }
-  } catch (e) {
-    log("Cleanup error: " + e.message, "warn");
-  }
+  try { if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch (e) {}
 }
 
 app.get("/", (req, res) => {
-  res.json({
-    name: "ClipAgent Backend",
-    status: "running",
-    uptime_seconds: Math.floor(process.uptime()),
-    channels: channels.length,
-    clips: clips.length,
-    posts: clips.filter(c => c.status === "posted").length
-  });
+  res.json({ name: "ClipAgent Backend", status: "running", uptime_seconds: Math.floor(process.uptime()), channels: channels.length, clips: clips.length, posts: clips.filter(c => c.status === "posted").length });
 });
 
 app.get("/api/stats", (req, res) => {
@@ -71,20 +56,11 @@ app.post("/api/channels", async (req, res) => {
     if (channels.find(c => c.url === url)) return res.status(400).json({ error: "Channel already added" });
     const handle = extractHandle(url);
     const info = await getYouTubeChannelInfo(handle);
-    const channel = {
-      id: Date.now().toString(), url, name: name || info.name || handle,
-      ytId: info.ytId || handle, clipLength: parseInt(clipLength),
-      postTo, autoPost: Boolean(autoPost), status: "active",
-      clipsGenerated: 0, postsPublished: 0, lastScanned: null,
-      addedAt: new Date().toISOString()
-    };
+    const channel = { id: Date.now().toString(), url, name: name || info.name || handle, ytId: info.ytId || handle, clipLength: parseInt(clipLength), postTo, autoPost: Boolean(autoPost), status: "active", clipsGenerated: 0, postsPublished: 0, lastScanned: null, addedAt: new Date().toISOString() };
     channels.push(channel);
     log("Channel added: " + channel.name, "success");
     res.json(channel);
-  } catch (err) {
-    log("Add channel error: " + err.message, "error");
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { log("Add channel error: " + err.message, "error"); res.status(500).json({ error: err.message }); }
 });
 
 app.delete("/api/channels/:id", (req, res) => {
@@ -99,14 +75,10 @@ app.patch("/api/channels/:id/toggle", (req, res) => {
   const ch = channels.find(c => c.id === req.params.id);
   if (!ch) return res.status(404).json({ error: "Not found" });
   ch.status = ch.status === "active" ? "paused" : "active";
-  log("Channel " + ch.status + ": " + ch.name, "info");
   res.json(ch);
 });
 
-app.delete("/api/clips/:id", (req, res) => {
-  clips = clips.filter(c => c.id !== req.params.id);
-  res.json({ success: true });
-});
+app.delete("/api/clips/:id", (req, res) => { clips = clips.filter(c => c.id !== req.params.id); res.json({ success: true }); });
 
 app.post("/api/clips/:id/post", async (req, res) => {
   try {
@@ -115,9 +87,7 @@ app.post("/api/clips/:id/post", async (req, res) => {
     const ch = channels.find(c => c.id === clip.channelId);
     await postClip(clip, ch);
     res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.post("/api/scan", async (req, res) => {
@@ -132,26 +102,15 @@ app.post("/api/scan", async (req, res) => {
     const active = channels.filter(c => c.status === "active");
     for (const ch of active) await scanChannel(ch);
     res.json({ success: true, scanned: active.length });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.post("/api/refresh-token", async (req, res) => {
   try {
-    const r = await axios.get("https://graph.facebook.com/v25.0/oauth/access_token", {
-      params: { grant_type: "fb_exchange_token", client_id: process.env.FACEBOOK_APP_ID, client_secret: process.env.FACEBOOK_APP_SECRET, fb_exchange_token: process.env.INSTAGRAM_ACCESS_TOKEN }
-    });
-    if (r.data.access_token) {
-      process.env.INSTAGRAM_ACCESS_TOKEN = r.data.access_token;
-      log("Instagram token refreshed", "success");
-      res.json({ success: true });
-    } else {
-      res.status(400).json({ error: "Could not refresh" });
-    }
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+    const r = await axios.get("https://graph.facebook.com/v25.0/oauth/access_token", { params: { grant_type: "fb_exchange_token", client_id: process.env.FACEBOOK_APP_ID, client_secret: process.env.FACEBOOK_APP_SECRET, fb_exchange_token: process.env.INSTAGRAM_ACCESS_TOKEN } });
+    if (r.data.access_token) { process.env.INSTAGRAM_ACCESS_TOKEN = r.data.access_token; log("Token refreshed", "success"); res.json({ success: true }); }
+    else res.status(400).json({ error: "Could not refresh" });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 function extractHandle(url) {
@@ -184,21 +143,42 @@ async function analyzeWithClaude(channel, videoTitle) {
   } catch (err) { log("Claude error: " + err.message, "warn"); return []; }
 }
 
-async function downloadYouTubeVideo(videoId) {
+// ================================================
+// DOWNLOAD VIA RAPIDAPI — bypasses YouTube blocks
+// ================================================
+async function downloadVideoViaRapidAPI(videoId) {
   const outputPath = path.join("/tmp", uuidv4() + "_raw.mp4");
-  log("Downloading video: " + videoId, "info");
-  return new Promise((resolve, reject) => {
-    try {
-      const videoUrl = "https://www.youtube.com/watch?v=" + videoId;
-      const stream = ytdl(videoUrl, { quality: "lowest", filter: "videoandaudio", requestOptions: { headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" } } });
-      const file = fs.createWriteStream(outputPath);
-      stream.pipe(file);
-      file.on("finish", () => { log("Download complete: " + outputPath, "success"); resolve(outputPath); });
-      file.on("error", (err) => { cleanFile(outputPath); reject(err); });
-      stream.on("error", (err) => { cleanFile(outputPath); reject(err); });
-      setTimeout(() => { cleanFile(outputPath); reject(new Error("Download timeout")); }, 120000);
-    } catch (err) { cleanFile(outputPath); reject(err); }
-  });
+  log("Fetching video URL via RapidAPI: " + videoId, "info");
+  try {
+    const response = await axios.get("https://youtube-video-download-info.p.rapidapi.com/dl", {
+      params: { id: videoId },
+      headers: {
+        "x-rapidapi-host": "youtube-video-download-info.p.rapidapi.com",
+        "x-rapidapi-key": process.env.RAPIDAPI_KEY
+      }
+    });
+
+    const formats = response.data.link;
+    if (!formats || formats.length === 0) throw new Error("No downloadable formats found");
+
+    // Find lowest quality mp4 to save bandwidth
+    const mp4 = formats.find(f => f[2] === "mp4" && f[3]) || formats[0];
+    const videoUrl = mp4[1];
+
+    log("Downloading from URL: " + videoUrl.slice(0, 60) + "...", "info");
+
+    const writer = fs.createWriteStream(outputPath);
+    const dlRes = await axios({ url: videoUrl, method: "GET", responseType: "stream", timeout: 120000 });
+    dlRes.data.pipe(writer);
+
+    return new Promise((resolve, reject) => {
+      writer.on("finish", () => { log("Download complete: " + outputPath, "success"); resolve(outputPath); });
+      writer.on("error", (err) => { cleanFile(outputPath); reject(err); });
+    });
+  } catch (err) {
+    cleanFile(outputPath);
+    throw new Error("RapidAPI download error: " + err.message);
+  }
 }
 
 async function cutVideoClip(inputPath, startSeconds, duration) {
@@ -236,17 +216,18 @@ async function postToInstagram(clip) {
     const igId = process.env.INSTAGRAM_BUSINESS_ID || process.env.INSTAGRAM_PAGE_ID;
     const token = process.env.INSTAGRAM_ACCESS_TOKEN;
     if (!clip.videoId || clip.videoId === "demo") { log("Skipping — no valid video ID: " + clip.clipTitle, "info"); return false; }
-    rawVideoPath = await downloadYouTubeVideo(clip.videoId);
-    const startSeconds = clip.startSeconds || 0;
-    const duration = clip.clipLength || 30;
-    clippedVideoPath = await cutVideoClip(rawVideoPath, startSeconds, duration);
+
+    rawVideoPath = await downloadVideoViaRapidAPI(clip.videoId);
+    clippedVideoPath = await cutVideoClip(rawVideoPath, clip.startSeconds || 0, clip.clipLength || 30);
     const videoUrl = await uploadToCloudinary(clippedVideoPath, clip.clipTitle);
+
     log("Posting Reel to Instagram: " + clip.clipTitle, "info");
-    const caption = clip.caption + "\n\n" + clip.clipTitle;
-    const createRes = await axios.post("https://graph.facebook.com/v25.0/" + igId + "/media", { media_type: "REELS", video_url: videoUrl, caption: caption, access_token: token });
+    const createRes = await axios.post("https://graph.facebook.com/v25.0/" + igId + "/media", { media_type: "REELS", video_url: videoUrl, caption: clip.caption + "\n\n" + clip.clipTitle, access_token: token });
     if (!createRes.data.id) throw new Error("Failed to create Instagram media container");
+
     const containerId = createRes.data.id;
     log("Instagram container created: " + containerId, "info");
+
     let ready = false;
     for (let i = 0; i < 18; i++) {
       await new Promise(r => setTimeout(r, 5000));
@@ -257,7 +238,9 @@ async function postToInstagram(clip) {
         if (statusRes.data.status_code === "ERROR") throw new Error("Instagram video processing failed");
       } catch (pollErr) { log("Poll error: " + pollErr.message, "warn"); }
     }
+
     if (!ready) throw new Error("Instagram video processing timed out");
+
     const publishRes = await axios.post("https://graph.facebook.com/v25.0/" + igId + "/media_publish", { creation_id: containerId, access_token: token });
     if (publishRes.data.id) { log("Instagram Reel published: " + clip.clipTitle, "success"); return true; }
   } catch (err) {
