@@ -144,41 +144,91 @@ async function analyzeWithClaude(channel, videoTitle) {
 }
 
 // ================================================
-// DOWNLOAD VIA RAPIDAPI — bypasses YouTube blocks
+// DOWNLOAD VIA RAPIDAPI — with retry + rate-limit queue
 // ================================================
+
+// Serialise all RapidAPI calls so concurrent scans never stack up
+let rapidApiQueue = Promise.resolve();
+let lastRapidApiCall = 0;
+const RAPIDAPI_MIN_GAP_MS = 3000; // at least 3 s between calls
+
+function withRapidApiQueue(fn) {
+  rapidApiQueue = rapidApiQueue.then(async () => {
+    const gap = Date.now() - lastRapidApiCall;
+    if (gap < RAPIDAPI_MIN_GAP_MS) {
+      await new Promise(r => setTimeout(r, RAPIDAPI_MIN_GAP_MS - gap));
+    }
+    lastRapidApiCall = Date.now();
+    return fn();
+  });
+  return rapidApiQueue;
+}
+
+async function fetchRapidApiWithRetry(videoId, maxRetries) {
+  if (maxRetries === undefined) maxRetries = 4;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const response = await axios.get("https://youtube-video-download-info.p.rapidapi.com/dl", {
+        params: { id: videoId },
+        headers: {
+          "x-rapidapi-host": "youtube-video-download-info.p.rapidapi.com",
+          "x-rapidapi-key": process.env.RAPIDAPI_KEY
+        },
+        timeout: 20000
+      });
+      return response.data;
+    } catch (err) {
+      const status = err.response && err.response.status;
+      const is429 = status === 429;
+      const is5xx = status >= 500;
+
+      if ((is429 || is5xx) && attempt < maxRetries) {
+        // Exponential backoff: 5s, 15s, 45s
+        const delay = Math.min(5000 * Math.pow(3, attempt - 1), 60000);
+        log("RapidAPI " + status + " on attempt " + attempt + "/" + maxRetries + " — retrying in " + (delay / 1000) + "s", "warn");
+        await new Promise(r => setTimeout(r, delay));
+        lastRapidApiCall = Date.now(); // reset gap timer after a wait
+      } else {
+        throw err;
+      }
+    }
+  }
+}
+
 async function downloadVideoViaRapidAPI(videoId) {
   const outputPath = path.join("/tmp", uuidv4() + "_raw.mp4");
   log("Fetching video URL via RapidAPI: " + videoId, "info");
-  try {
-    const response = await axios.get("https://youtube-video-download-info.p.rapidapi.com/dl", {
-      params: { id: videoId },
-      headers: {
-        "x-rapidapi-host": "youtube-video-download-info.p.rapidapi.com",
-        "x-rapidapi-key": process.env.RAPIDAPI_KEY
+
+  return withRapidApiQueue(async () => {
+    try {
+      const data = await fetchRapidApiWithRetry(videoId);
+
+      const formats = data && data.link;
+      if (!formats || formats.length === 0) throw new Error("No downloadable formats found");
+
+      // Prefer lowest-quality mp4 to save bandwidth
+      const mp4 = formats.find(f => f[2] === "mp4" && f[3]) || formats.find(f => f[2] === "mp4") || formats[0];
+      const videoUrl = mp4[1];
+
+      log("Downloading from URL: " + videoUrl.slice(0, 60) + "...", "info");
+
+      const writer = fs.createWriteStream(outputPath);
+      const dlRes = await axios({ url: videoUrl, method: "GET", responseType: "stream", timeout: 120000 });
+      dlRes.data.pipe(writer);
+
+      return new Promise((resolve, reject) => {
+        writer.on("finish", () => { log("Download complete: " + outputPath, "success"); resolve(outputPath); });
+        writer.on("error", (err) => { cleanFile(outputPath); reject(err); });
+      });
+    } catch (err) {
+      cleanFile(outputPath);
+      const status = err.response && err.response.status;
+      if (status === 429) {
+        throw new Error("RapidAPI rate limit exceeded after all retries — try again in a few minutes");
       }
-    });
-
-    const formats = response.data.link;
-    if (!formats || formats.length === 0) throw new Error("No downloadable formats found");
-
-    // Find lowest quality mp4 to save bandwidth
-    const mp4 = formats.find(f => f[2] === "mp4" && f[3]) || formats[0];
-    const videoUrl = mp4[1];
-
-    log("Downloading from URL: " + videoUrl.slice(0, 60) + "...", "info");
-
-    const writer = fs.createWriteStream(outputPath);
-    const dlRes = await axios({ url: videoUrl, method: "GET", responseType: "stream", timeout: 120000 });
-    dlRes.data.pipe(writer);
-
-    return new Promise((resolve, reject) => {
-      writer.on("finish", () => { log("Download complete: " + outputPath, "success"); resolve(outputPath); });
-      writer.on("error", (err) => { cleanFile(outputPath); reject(err); });
-    });
-  } catch (err) {
-    cleanFile(outputPath);
-    throw new Error("RapidAPI download error: " + err.message);
-  }
+      throw new Error("RapidAPI download error: " + err.message);
+    }
+  });
 }
 
 async function cutVideoClip(inputPath, startSeconds, duration) {
@@ -272,7 +322,7 @@ async function scanChannel(channel) {
         clips.unshift(clip);
         channel.clipsGenerated++;
         log("Clip ready: " + s.title + " Score: " + s.viralScore + "%", "success");
-        if (channel.autoPost) await postClip(clip, channel);
+        if (channel.autoPost) { await postClip(clip, channel); await new Promise(r => setTimeout(r, 5000)); }
       }
     }
   } catch (err) { log("Scan error: " + err.message, "error"); }
