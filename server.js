@@ -180,9 +180,10 @@ async function fetchRapidApiWithRetry(videoId, maxRetries) {
     } catch (err) {
       const status = err.response && err.response.status;
       const is429 = status === 429;
+      const is403 = status === 403;
       const is5xx = status >= 500;
 
-      if ((is429 || is5xx) && attempt < maxRetries) {
+      if ((is429 || is403 || is5xx) && attempt < maxRetries) {
         // Exponential backoff: 5s, 15s, 45s
         const delay = Math.min(5000 * Math.pow(3, attempt - 1), 60000);
         log("RapidAPI " + status + " on attempt " + attempt + "/" + maxRetries + " — retrying in " + (delay / 1000) + "s", "warn");
@@ -206,14 +207,34 @@ async function downloadVideoViaRapidAPI(videoId) {
       const formats = data && data.link;
       if (!formats || formats.length === 0) throw new Error("No downloadable formats found");
 
-      // Prefer lowest-quality mp4 to save bandwidth
-      const mp4 = formats.find(f => f[2] === "mp4" && f[3]) || formats.find(f => f[2] === "mp4") || formats[0];
-      const videoUrl = mp4[1];
+      // Pick best mp4: must have a URL (index 1), be mp4 (index 2), have audio (index 3 truthy)
+      // Sort by quality ascending so we grab smallest file that still has audio
+      const mp4sWithAudio = formats.filter(f => f[1] && f[2] === "mp4" && f[3]);
+      const mp4sAny      = formats.filter(f => f[1] && f[2] === "mp4");
+      const fallback     = formats.filter(f => f[1]);
 
-      log("Downloading from URL: " + videoUrl.slice(0, 60) + "...", "info");
+      const chosen = mp4sWithAudio[0] || mp4sAny[0] || fallback[0];
+      if (!chosen) throw new Error("No usable format found in RapidAPI response");
+
+      const videoUrl = chosen[1];
+      log("Downloading format: " + (chosen[2] || "?") + " audio=" + !!chosen[3] + " url=" + videoUrl.slice(0, 70) + "...", "info");
 
       const writer = fs.createWriteStream(outputPath);
-      const dlRes = await axios({ url: videoUrl, method: "GET", responseType: "stream", timeout: 120000 });
+      // Must send browser-like headers — YouTube CDN returns 403 to bare axios requests
+      const dlRes = await axios({
+        url: videoUrl,
+        method: "GET",
+        responseType: "stream",
+        timeout: 120000,
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+          "Referer": "https://www.youtube.com/",
+          "Origin": "https://www.youtube.com",
+          "Accept": "*/*",
+          "Accept-Language": "en-US,en;q=0.9",
+          "Range": "bytes=0-"
+        }
+      });
       dlRes.data.pipe(writer);
 
       return new Promise((resolve, reject) => {
@@ -223,9 +244,8 @@ async function downloadVideoViaRapidAPI(videoId) {
     } catch (err) {
       cleanFile(outputPath);
       const status = err.response && err.response.status;
-      if (status === 429) {
-        throw new Error("RapidAPI rate limit exceeded after all retries — try again in a few minutes");
-      }
+      if (status === 429) throw new Error("RapidAPI rate limit exceeded after all retries — try again in a few minutes");
+      if (status === 403) throw new Error("CDN blocked the download (403) — YouTube signed URL may have expired, will retry next scan");
       throw new Error("RapidAPI download error: " + err.message);
     }
   });
