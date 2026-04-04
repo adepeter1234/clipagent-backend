@@ -8,7 +8,6 @@ const path = require("path");
 const { v4: uuidv4 } = require("uuid");
 const cloudinary = require("cloudinary").v2;
 const ffmpeg = require("fluent-ffmpeg");
-// ffmpeg binary installed via apt in Dockerfile
 const ytdl = require("@distube/ytdl-core");
 
 cloudinary.config({
@@ -21,9 +20,6 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ============================================================
-// PERSISTENT STORE — survives server restarts
-// ============================================================
 const DATA_FILE = process.env.DATA_FILE || "/tmp/clipagent_data.json";
 
 function loadData() {
@@ -32,15 +28,12 @@ function loadData() {
       const raw = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
       channels = raw.channels || [];
       clips = raw.clips || [];
-      log("Loaded " + channels.length + " channels, " + clips.length + " clips from disk", "info");
     }
-  } catch(e) { log("Could not load data file: " + e.message, "warn"); }
+  } catch(e) {}
 }
 
 function saveData() {
-  try {
-    fs.writeFileSync(DATA_FILE, JSON.stringify({ channels, clips }, null, 2));
-  } catch(e) { log("Could not save data: " + e.message, "warn"); }
+  try { fs.writeFileSync(DATA_FILE, JSON.stringify({ channels, clips }, null, 2)); } catch(e) {}
 }
 
 let channels = [];
@@ -171,70 +164,85 @@ async function analyzeWithClaude(channel, videoTitle) {
   } catch (err) { log("Claude error: " + err.message, "warn"); return []; }
 }
 
-// ================================================
-// DOWNLOAD via @distube/ytdl-core — pure Node, no binaries needed
-// ================================================
-async function downloadVideoViaRapidAPI(videoId) {
-  const outputPath = path.join("/tmp", uuidv4() + "_raw.mp4");
-  const videoUrl = "https://www.youtube.com/watch?v=" + videoId;
-  log("Downloading via ytdl-core: " + videoId, "info");
+// Global download queue — only 1 download at a time to avoid rate limits
+let downloadQueue = Promise.resolve();
+let lastDownloadTime = 0;
+const MIN_DOWNLOAD_GAP_MS = 8000; // 8s between downloads
 
-  // Validate video is accessible first
-  if (!ytdl.validateID(videoId)) throw new Error("Invalid YouTube video ID: " + videoId);
+async function downloadVideo(videoId) {
+  return new Promise((resolve, reject) => {
+    downloadQueue = downloadQueue.then(async () => {
+      // Enforce minimum gap between downloads
+      const gap = Date.now() - lastDownloadTime;
+      if (gap < MIN_DOWNLOAD_GAP_MS) await new Promise(r => setTimeout(r, MIN_DOWNLOAD_GAP_MS - gap));
+      lastDownloadTime = Date.now();
 
-  return new Promise(async (resolve, reject) => {
-    const timeout = setTimeout(() => {
-      cleanFile(outputPath);
-      reject(new Error("Download timed out after 3 minutes"));
-    }, 180000);
+      const outputPath = path.join("/tmp", uuidv4() + "_raw.mp4");
+      const videoUrl = "https://www.youtube.com/watch?v=" + videoId;
+      log("Downloading via ytdl-core: " + videoId, "info");
 
-    try {
-      const info = await ytdl.getInfo(videoUrl);
-      // Pick best combined mp4 format under 720p to keep file size reasonable
-      const format = ytdl.chooseFormat(info.formats, {
-        quality: "highestvideo",
-        filter: f => f.container === "mp4" && f.hasVideo && f.hasAudio && (f.height || 9999) <= 720
-      }) || ytdl.chooseFormat(info.formats, { quality: "lowestvideo", filter: "audioandvideo" });
+      if (!ytdl.validateID(videoId)) return reject(new Error("Invalid YouTube video ID: " + videoId));
 
-      if (!format) { clearTimeout(timeout); cleanFile(outputPath); return reject(new Error("No suitable mp4 format found for video: " + videoId)); }
-      log("Downloading format: " + format.qualityLabel + " " + format.container, "info");
+      const timeout = setTimeout(() => { cleanFile(outputPath); reject(new Error("Download timed out")); }, 180000);
 
-      const writer = fs.createWriteStream(outputPath);
-      const stream = ytdl.downloadFromInfo(info, { format });
+      // Retry up to 3 times on 429
+      let lastErr;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          const info = await ytdl.getInfo(videoUrl);
+          const format = ytdl.chooseFormat(info.formats, {
+            quality: "highestvideo",
+            filter: f => f.container === "mp4" && f.hasVideo && f.hasAudio && (f.height || 9999) <= 720
+          }) || ytdl.chooseFormat(info.formats, { quality: "lowestvideo", filter: "audioandvideo" });
 
-      stream.pipe(writer);
-      stream.on("error", (err) => { clearTimeout(timeout); cleanFile(outputPath); reject(new Error("ytdl stream error: " + err.message)); });
-      writer.on("error", (err) => { clearTimeout(timeout); cleanFile(outputPath); reject(new Error("Write error: " + err.message)); });
-      writer.on("finish", () => {
-        clearTimeout(timeout);
-        if (!fs.existsSync(outputPath) || fs.statSync(outputPath).size === 0) {
-          cleanFile(outputPath);
-          return reject(new Error("Download finished but file is empty"));
+          if (!format) { clearTimeout(timeout); cleanFile(outputPath); return reject(new Error("No suitable mp4 format found")); }
+          log("Attempt " + attempt + " — format: " + (format.qualityLabel || "?") + " " + format.container, "info");
+
+          const writer = fs.createWriteStream(outputPath);
+          const stream = ytdl.downloadFromInfo(info, { format });
+
+          await new Promise((res, rej) => {
+            stream.pipe(writer);
+            stream.on("error", rej);
+            writer.on("error", rej);
+            writer.on("finish", res);
+          });
+
+          clearTimeout(timeout);
+          if (!fs.existsSync(outputPath) || fs.statSync(outputPath).size === 0) {
+            cleanFile(outputPath); return reject(new Error("Download empty"));
+          }
+          log("Download complete: " + outputPath, "success");
+          return resolve(outputPath);
+
+        } catch (err) {
+          lastErr = err;
+          const is429 = err.message && (err.message.includes("429") || err.message.includes("Status code: 429"));
+          if (is429 && attempt < 3) {
+            const wait = attempt * 15000; // 15s, 30s
+            log("429 rate limit — waiting " + (wait/1000) + "s before retry " + (attempt+1), "warn");
+            await new Promise(r => setTimeout(r, wait));
+            lastDownloadTime = Date.now();
+          } else {
+            break;
+          }
         }
-        log("Download complete: " + outputPath, "success");
-        resolve(outputPath);
-      });
-    } catch (err) {
+      }
       clearTimeout(timeout);
       cleanFile(outputPath);
-      if (err.message && (err.message.includes("Sign in") || err.message.includes("private") || err.message.includes("unavailable"))) {
-        return reject(new Error("Video unavailable or private: " + videoId));
-      }
-      return reject(new Error("Download error: " + err.message));
-    }
+      return reject(new Error("Download error: " + (lastErr ? lastErr.message : "unknown")));
+    });
   });
 }
 
 async function cutVideoClip(inputPath, startSeconds, duration) {
   const outputPath = path.join("/tmp", uuidv4() + "_clip.mp4");
-  const start = startSeconds || 0;
-  const clipDuration = duration || 30;
-  log("Cutting clip: start=" + start + "s duration=" + clipDuration + "s", "info");
+  log("Cutting clip: start=" + (startSeconds||0) + "s duration=" + (duration||30) + "s", "info");
   return new Promise((resolve, reject) => {
-    ffmpeg(inputPath).setStartTime(start).setDuration(clipDuration).videoCodec("libx264").audioCodec("aac")
+    ffmpeg(inputPath).setStartTime(startSeconds||0).setDuration(duration||30).videoCodec("libx264").audioCodec("aac")
       .outputOptions(["-preset ultrafast", "-crf 28", "-vf scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2", "-movflags +faststart", "-pix_fmt yuv420p"])
       .output(outputPath)
-      .on("end", () => { log("Clip ready: " + outputPath, "success"); resolve(outputPath); })
+      .on("end", () => { log("Clip ready", "success"); resolve(outputPath); })
       .on("error", (err) => { cleanFile(outputPath); reject(new Error("FFmpeg error: " + err.message)); })
       .run();
     setTimeout(() => { cleanFile(outputPath); reject(new Error("FFmpeg timeout")); }, 180000);
@@ -245,56 +253,40 @@ async function uploadToCloudinary(filePath, clipTitle) {
   log("Uploading to Cloudinary: " + clipTitle, "info");
   return new Promise((resolve, reject) => {
     cloudinary.uploader.upload(filePath, { resource_type: "video", public_id: "clipagent_" + Date.now(), folder: "clipagent", overwrite: true },
-      (error, result) => {
-        if (error) reject(new Error("Cloudinary error: " + error.message));
-        else { log("Cloudinary done: " + result.secure_url, "success"); resolve(result.secure_url); }
-      }
+      (error, result) => { if (error) reject(new Error("Cloudinary error: " + error.message)); else { log("Cloudinary done: " + result.secure_url, "success"); resolve(result.secure_url); } }
     );
   });
 }
 
 async function postToInstagram(clip) {
-  let rawVideoPath = null;
-  let clippedVideoPath = null;
+  let rawVideoPath = null, clippedVideoPath = null;
   try {
     const igId = process.env.INSTAGRAM_BUSINESS_ID || process.env.INSTAGRAM_PAGE_ID;
     const token = process.env.INSTAGRAM_ACCESS_TOKEN;
-    if (!clip.videoId || clip.videoId === "demo") { log("Skipping — no valid video ID: " + clip.clipTitle, "info"); return false; }
-
-    rawVideoPath = await downloadVideoViaRapidAPI(clip.videoId);
+    if (!clip.videoId || clip.videoId === "demo") { log("Skipping — no valid video ID", "info"); return false; }
+    rawVideoPath = await downloadVideo(clip.videoId);
     clippedVideoPath = await cutVideoClip(rawVideoPath, clip.startSeconds || 0, clip.clipLength || 30);
     const videoUrl = await uploadToCloudinary(clippedVideoPath, clip.clipTitle);
-
     log("Posting Reel to Instagram: " + clip.clipTitle, "info");
     const createRes = await axios.post("https://graph.facebook.com/v25.0/" + igId + "/media", { media_type: "REELS", video_url: videoUrl, caption: clip.caption + "\n\n" + clip.clipTitle, access_token: token });
-    if (!createRes.data.id) throw new Error("Failed to create Instagram media container");
-
+    if (!createRes.data.id) throw new Error("Failed to create media container");
     const containerId = createRes.data.id;
-    log("Instagram container created: " + containerId, "info");
-
     let ready = false;
     for (let i = 0; i < 18; i++) {
       await new Promise(r => setTimeout(r, 5000));
       try {
         const statusRes = await axios.get("https://graph.facebook.com/v25.0/" + containerId + "?fields=status_code&access_token=" + token);
-        log("Instagram status: " + statusRes.data.status_code, "info");
         if (statusRes.data.status_code === "FINISHED") { ready = true; break; }
-        if (statusRes.data.status_code === "ERROR") throw new Error("Instagram video processing failed");
+        if (statusRes.data.status_code === "ERROR") throw new Error("Instagram processing failed");
       } catch (pollErr) { log("Poll error: " + pollErr.message, "warn"); }
     }
-
-    if (!ready) throw new Error("Instagram video processing timed out");
-
+    if (!ready) throw new Error("Instagram processing timed out");
     const publishRes = await axios.post("https://graph.facebook.com/v25.0/" + igId + "/media_publish", { creation_id: containerId, access_token: token });
     if (publishRes.data.id) { log("Instagram Reel published: " + clip.clipTitle, "success"); return true; }
   } catch (err) {
     const msg = err.response && err.response.data && err.response.data.error ? err.response.data.error.message : err.message;
-    log("Instagram error: " + msg, "warn");
-    return false;
-  } finally {
-    cleanFile(rawVideoPath);
-    cleanFile(clippedVideoPath);
-  }
+    log("Instagram error: " + msg, "warn"); return false;
+  } finally { cleanFile(rawVideoPath); cleanFile(clippedVideoPath); }
 }
 
 async function scanChannel(channel) {
@@ -322,6 +314,7 @@ async function scanChannel(channel) {
     }
   } catch (err) { log("Scan error: " + err.message, "error"); }
   channel.status = "active";
+  saveData();
 }
 
 async function postClip(clip, channel) {
@@ -329,11 +322,8 @@ async function postClip(clip, channel) {
   log("Posting: " + clip.clipTitle, "info");
   try {
     if (channel.postTo === "all" || channel.postTo === "instagram") await postToInstagram(clip);
-    clip.status = "posted";
-    clip.postedAt = new Date().toISOString();
-    channel.postsPublished++;
-    saveData();
-    log("Posted: " + clip.clipTitle, "success");
+    clip.status = "posted"; clip.postedAt = new Date().toISOString(); channel.postsPublished++;
+    saveData(); log("Posted: " + clip.clipTitle, "success");
   } catch (err) { log("Post error: " + err.message, "warn"); clip.status = "failed"; saveData(); }
 }
 
