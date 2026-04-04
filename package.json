@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "pip install yt-dlp --quiet && node server.js"
   },
   "dependencies": {
     "express": "^4.18.2",
@@ -16,7 +16,4 @@
     "@distube/ytdl-core": "^4.16.8",
     "uuid": "^9.0.0"
   }
-  "scripts": {
-  "start": "pip install yt-dlp --quiet && node server.js"
-}
 }
