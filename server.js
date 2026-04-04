@@ -8,8 +8,7 @@ const path = require("path");
 const { v4: uuidv4 } = require("uuid");
 const cloudinary = require("cloudinary").v2;
 const ffmpeg = require("fluent-ffmpeg");
-const ffmpegInstaller = require("@ffmpeg-installer/ffmpeg");
-ffmpeg.setFfmpegPath(ffmpegInstaller.path);
+// ffmpeg binary installed via apt in Dockerfile
 const ytdl = require("@distube/ytdl-core");
 
 cloudinary.config({
