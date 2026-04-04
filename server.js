@@ -8,6 +8,8 @@ const path = require("path");
 const { v4: uuidv4 } = require("uuid");
 const cloudinary = require("cloudinary").v2;
 const ffmpeg = require("fluent-ffmpeg");
+const ffmpegPath = require("ffmpeg-static");
+ffmpeg.setFfmpegPath(ffmpegPath);
 const ytdl = require("@distube/ytdl-core");
 
 cloudinary.config({
@@ -195,7 +197,7 @@ async function downloadVideoViaRapidAPI(videoId) {
         filter: f => f.container === "mp4" && f.hasVideo && f.hasAudio && (f.height || 9999) <= 720
       }) || ytdl.chooseFormat(info.formats, { quality: "lowestvideo", filter: "audioandvideo" });
 
-      if (!format) throw new Error("No suitable mp4 format found for video: " + videoId);
+      if (!format) { clearTimeout(timeout); cleanFile(outputPath); return reject(new Error("No suitable mp4 format found for video: " + videoId)); }
       log("Downloading format: " + format.qualityLabel + " " + format.container, "info");
 
       const writer = fs.createWriteStream(outputPath);
@@ -217,9 +219,9 @@ async function downloadVideoViaRapidAPI(videoId) {
       clearTimeout(timeout);
       cleanFile(outputPath);
       if (err.message && (err.message.includes("Sign in") || err.message.includes("private") || err.message.includes("unavailable"))) {
-        throw new Error("Video unavailable or private: " + videoId);
+        return reject(new Error("Video unavailable or private: " + videoId));
       }
-      throw new Error("Download error: " + err.message);
+      return reject(new Error("Download error: " + err.message));
     }
   });
 }
