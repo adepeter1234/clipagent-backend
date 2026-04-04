@@ -20,9 +20,32 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// ============================================================
+// PERSISTENT STORE — survives server restarts
+// ============================================================
+const DATA_FILE = process.env.DATA_FILE || "/tmp/clipagent_data.json";
+
+function loadData() {
+  try {
+    if (fs.existsSync(DATA_FILE)) {
+      const raw = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
+      channels = raw.channels || [];
+      clips = raw.clips || [];
+      log("Loaded " + channels.length + " channels, " + clips.length + " clips from disk", "info");
+    }
+  } catch(e) { log("Could not load data file: " + e.message, "warn"); }
+}
+
+function saveData() {
+  try {
+    fs.writeFileSync(DATA_FILE, JSON.stringify({ channels, clips }, null, 2));
+  } catch(e) { log("Could not save data: " + e.message, "warn"); }
+}
+
 let channels = [];
 let clips = [];
 let logs = [];
+loadData();
 
 function log(msg, type) {
   if (!type) type = "info";
@@ -59,6 +82,7 @@ app.post("/api/channels", async (req, res) => {
     const info = await getYouTubeChannelInfo(handle);
     const channel = { id: Date.now().toString(), url, name: name || info.name || handle, ytId: info.ytId || handle, clipLength: parseInt(clipLength), postTo, autoPost: Boolean(autoPost), status: "active", clipsGenerated: 0, postsPublished: 0, lastScanned: null, addedAt: new Date().toISOString() };
     channels.push(channel);
+    saveData();
     log("Channel added: " + channel.name, "success");
     res.json(channel);
   } catch (err) { log("Add channel error: " + err.message, "error"); res.status(500).json({ error: err.message }); }
@@ -68,6 +92,7 @@ app.delete("/api/channels/:id", (req, res) => {
   const ch = channels.find(c => c.id === req.params.id);
   if (!ch) return res.status(404).json({ error: "Not found" });
   channels = channels.filter(c => c.id !== req.params.id);
+  saveData();
   log("Channel removed: " + ch.name, "warn");
   res.json({ success: true });
 });
@@ -76,10 +101,11 @@ app.patch("/api/channels/:id/toggle", (req, res) => {
   const ch = channels.find(c => c.id === req.params.id);
   if (!ch) return res.status(404).json({ error: "Not found" });
   ch.status = ch.status === "active" ? "paused" : "active";
+  saveData();
   res.json(ch);
 });
 
-app.delete("/api/clips/:id", (req, res) => { clips = clips.filter(c => c.id !== req.params.id); res.json({ success: true }); });
+app.delete("/api/clips/:id", (req, res) => { clips = clips.filter(c => c.id !== req.params.id); saveData(); res.json({ success: true }); });
 
 app.post("/api/clips/:id/post", async (req, res) => {
   try {
@@ -288,6 +314,7 @@ async function scanChannel(channel) {
         const clip = { id: Date.now().toString() + Math.random().toString(36).slice(2, 7), channelId: channel.id, channelName: channel.name, videoId, videoTitle: title, clipTitle: s.title, startTime: s.startTime, endTime: s.endTime, startSeconds: s.startSeconds || 0, clipLength: channel.clipLength, duration: channel.clipLength + "s", viralScore: s.viralScore, reason: s.reason, caption: s.caption, status: channel.autoPost ? "queued" : "ready", createdAt: new Date().toISOString(), postedAt: null };
         clips.unshift(clip);
         channel.clipsGenerated++;
+        saveData();
         log("Clip ready: " + s.title + " Score: " + s.viralScore + "%", "success");
         if (channel.autoPost) { await postClip(clip, channel); await new Promise(r => setTimeout(r, 5000)); }
       }
@@ -304,8 +331,9 @@ async function postClip(clip, channel) {
     clip.status = "posted";
     clip.postedAt = new Date().toISOString();
     channel.postsPublished++;
+    saveData();
     log("Posted: " + clip.clipTitle, "success");
-  } catch (err) { log("Post error: " + err.message, "warn"); clip.status = "failed"; }
+  } catch (err) { log("Post error: " + err.message, "warn"); clip.status = "failed"; saveData(); }
 }
 
 cron.schedule("0 * * * *", async () => {
