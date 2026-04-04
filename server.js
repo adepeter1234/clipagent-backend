@@ -8,6 +8,7 @@ const path = require("path");
 const { v4: uuidv4 } = require("uuid");
 const cloudinary = require("cloudinary").v2;
 const ffmpeg = require("fluent-ffmpeg");
+const ytdl = require("@distube/ytdl-core");
 
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME || "dj4mtzmjk",
@@ -144,73 +145,56 @@ async function analyzeWithClaude(channel, videoTitle) {
 }
 
 // ================================================
-// DOWNLOAD VIA yt-dlp — reliable, no RapidAPI needed
+// DOWNLOAD via @distube/ytdl-core — pure Node, no binaries needed
 // ================================================
-const { execFile, exec } = require("child_process");
-
-// Ensure yt-dlp is installed at startup
-function ensureYtDlp() {
-  return new Promise((resolve) => {
-    exec("which yt-dlp", (err) => {
-      if (!err) { log("yt-dlp already installed", "info"); return resolve(); }
-      log("Installing yt-dlp...", "info");
-      exec("pip install yt-dlp --break-system-packages --quiet || pip3 install yt-dlp --quiet", (err2) => {
-        if (err2) {
-          // Try curl install as fallback (works on Railway/most Linux)
-          exec("curl -sL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp && chmod a+rx /usr/local/bin/yt-dlp", (err3) => {
-            if (err3) log("yt-dlp install failed — downloads will not work: " + err3.message, "error");
-            else log("yt-dlp installed via curl", "success");
-            resolve();
-          });
-        } else {
-          log("yt-dlp installed via pip", "success");
-          resolve();
-        }
-      });
-    });
-  });
-}
-ensureYtDlp();
-
 async function downloadVideoViaRapidAPI(videoId) {
-  // Name kept for backward compat — now uses yt-dlp instead of RapidAPI
   const outputPath = path.join("/tmp", uuidv4() + "_raw.mp4");
   const videoUrl = "https://www.youtube.com/watch?v=" + videoId;
-  log("Downloading via yt-dlp: " + videoId, "info");
+  log("Downloading via ytdl-core: " + videoId, "info");
 
-  return new Promise((resolve, reject) => {
-    const args = [
-      "--no-playlist",
-      "-f", "bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4][height<=720]/best[height<=720]",
-      "--merge-output-format", "mp4",
-      "--no-warnings",
-      "--quiet",
-      "-o", outputPath,
-      videoUrl
-    ];
+  // Validate video is accessible first
+  if (!ytdl.validateID(videoId)) throw new Error("Invalid YouTube video ID: " + videoId);
 
+  return new Promise(async (resolve, reject) => {
     const timeout = setTimeout(() => {
       cleanFile(outputPath);
-      reject(new Error("yt-dlp download timed out after 3 minutes"));
+      reject(new Error("Download timed out after 3 minutes"));
     }, 180000);
 
-    execFile("yt-dlp", args, (err, stdout, stderr) => {
-      clearTimeout(timeout);
-      if (err) {
-        cleanFile(outputPath);
-        const msg = stderr || err.message;
-        if (msg.includes("Sign in") || msg.includes("bot") || msg.includes("429")) {
-          return reject(new Error("YouTube is rate-limiting downloads — try again in 10 minutes"));
+    try {
+      const info = await ytdl.getInfo(videoUrl);
+      // Pick best combined mp4 format under 720p to keep file size reasonable
+      const format = ytdl.chooseFormat(info.formats, {
+        quality: "highestvideo",
+        filter: f => f.container === "mp4" && f.hasVideo && f.hasAudio && (f.height || 9999) <= 720
+      }) || ytdl.chooseFormat(info.formats, { quality: "lowestvideo", filter: "audioandvideo" });
+
+      if (!format) throw new Error("No suitable mp4 format found for video: " + videoId);
+      log("Downloading format: " + format.qualityLabel + " " + format.container, "info");
+
+      const writer = fs.createWriteStream(outputPath);
+      const stream = ytdl.downloadFromInfo(info, { format });
+
+      stream.pipe(writer);
+      stream.on("error", (err) => { clearTimeout(timeout); cleanFile(outputPath); reject(new Error("ytdl stream error: " + err.message)); });
+      writer.on("error", (err) => { clearTimeout(timeout); cleanFile(outputPath); reject(new Error("Write error: " + err.message)); });
+      writer.on("finish", () => {
+        clearTimeout(timeout);
+        if (!fs.existsSync(outputPath) || fs.statSync(outputPath).size === 0) {
+          cleanFile(outputPath);
+          return reject(new Error("Download finished but file is empty"));
         }
-        return reject(new Error("yt-dlp error: " + msg.trim().split("\n").pop()));
+        log("Download complete: " + outputPath, "success");
+        resolve(outputPath);
+      });
+    } catch (err) {
+      clearTimeout(timeout);
+      cleanFile(outputPath);
+      if (err.message && (err.message.includes("Sign in") || err.message.includes("private") || err.message.includes("unavailable"))) {
+        throw new Error("Video unavailable or private: " + videoId);
       }
-      if (!fs.existsSync(outputPath) || fs.statSync(outputPath).size === 0) {
-        cleanFile(outputPath);
-        return reject(new Error("yt-dlp finished but output file is missing or empty"));
-      }
-      log("Download complete: " + outputPath, "success");
-      resolve(outputPath);
-    });
+      throw new Error("Download error: " + err.message);
+    }
   });
 }
 
