@@ -39,6 +39,22 @@ function saveData() {
 let channels = [];
 let clips = [];
 let logs = [];
+let lastPostTime = 0;
+let lastScanTime = 0;
+const MIN_POST_GAP_MS = 30 * 60 * 1000;
+const MIN_SCAN_GAP_MS = 60 * 60 * 1000;
+
+async function waitForPostSlot() {
+  const now = Date.now();
+  const elapsed = now - lastPostTime;
+  if (elapsed < MIN_POST_GAP_MS) {
+    const waitMs = MIN_POST_GAP_MS - elapsed;
+    const waitMins = Math.ceil(waitMs / 60000);
+    log("Post throttle: waiting " + waitMins + " min before next post", "info");
+    await new Promise(r => setTimeout(r, waitMs));
+  }
+  lastPostTime = Date.now();
+}
 loadData();
 
 function log(msg, type) {
@@ -107,6 +123,8 @@ app.post("/api/clips/:id/post", async (req, res) => {
     if (!clip) return res.status(404).json({ error: "Not found" });
     const ch = channels.find(c => c.id === clip.channelId);
     await postClip(clip, ch);
+    await waitForPostSlot(); // ← add this line
+if (channel.postTo === "all" || ...
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -335,7 +353,23 @@ cron.schedule("0 * * * *", async () => {
     for (const ch of active) await scanChannel(ch);
   } catch (err) { log("Auto-scan error: " + err.message, "error"); }
 });
-
+cron.schedule("0 * * * *", async () => {
+  try {
+    const now = Date.now();
+    if (now - lastScanTime < MIN_SCAN_GAP_MS) {
+      log("Scan throttle: skipping — too soon", "info");
+      return;
+    }
+    lastScanTime = now;
+    const active = channels.filter(c => c.status === "active");
+    if (!active.length) return;
+    log("Auto-scan: " + active.length + " channel(s)", "info");
+    for (let i = 0; i < active.length; i++) {
+      if (i > 0) await new Promise(r => setTimeout(r, 15000));
+      await scanChannel(active[i]);
+    }
+  } catch (err) { log("Auto-scan error: " + err.message, "error"); }
+});
 cron.schedule("0 0 * * *", async () => {
   try {
     const r = await axios.get("https://graph.facebook.com/v25.0/oauth/access_token", { params: { grant_type: "fb_exchange_token", client_id: process.env.FACEBOOK_APP_ID, client_secret: process.env.FACEBOOK_APP_SECRET, fb_exchange_token: process.env.INSTAGRAM_ACCESS_TOKEN } });
