@@ -347,12 +347,23 @@ async function postClip(clip, channel) {
   log("Posting: " + clip.clipTitle, "info");
   try {
     await waitForPostSlot();
-    if (channel.postTo === "all" || channel.postTo === "instagram") await postToInstagram(clip);
-    clip.status = "posted";
-    clip.postedAt = new Date().toISOString();
-    channel.postsPublished++;
-    log("Posted: " + clip.clipTitle, "success");
-  } catch (err) { log("Post error: " + err.message, "warn"); clip.status = "failed"; }
+    let success = false;
+    if (channel.postTo === "all" || channel.postTo === "instagram") {
+      success = await postToInstagram(clip);
+    }
+    if (success) {
+      clip.status = "posted";
+      clip.postedAt = new Date().toISOString();
+      channel.postsPublished++;
+      log("Posted successfully: " + clip.clipTitle, "success");
+    } else {
+      clip.status = "failed";
+      log("Post failed — Instagram returned false: " + clip.clipTitle, "warn");
+    }
+  } catch (err) {
+    log("Post error: " + err.message, "warn");
+    clip.status = "failed";
+  }
 }
 
 cron.schedule("0 * * * *", async () => {
