@@ -182,10 +182,33 @@ async function analyzeWithClaude(channel, videoTitle) {
 // DOWNLOAD USING yt-dlp (installed via nixpacks)
 // No npm package needed — uses system binary
 // ================================================
+// Find yt-dlp binary in common locations
+function findYtDlp() {
+  const locations = [
+    "yt-dlp",
+    "/usr/local/bin/yt-dlp",
+    "/usr/bin/yt-dlp",
+    "/home/user/.local/bin/yt-dlp"
+  ];
+  for (const loc of locations) {
+    try {
+      require("child_process").execFileSync(loc, ["--version"], { timeout: 5000 });
+      log("Found yt-dlp at: " + loc, "info");
+      return loc;
+    } catch(e) {}
+  }
+  return null;
+}
+
 async function downloadYouTubeVideo(videoId) {
   const outputPath = path.join("/tmp", uuidv4() + "_raw.mp4");
   const videoUrl = "https://www.youtube.com/watch?v=" + videoId;
   log("Downloading via yt-dlp: " + videoId, "info");
+
+  const ytdlpBin = findYtDlp();
+  if (!ytdlpBin) {
+    throw new Error("yt-dlp not found on this server. Please ensure it is installed.");
+  }
 
   return new Promise((resolve, reject) => {
     const args = [
@@ -194,43 +217,46 @@ async function downloadYouTubeVideo(videoId) {
       "--output", outputPath,
       "--no-warnings",
       "--quiet",
+      "--no-check-certificate",
       videoUrl
     ];
 
-    // Add cookies if available
     const cookiesPath = "/tmp/yt_cookies.txt";
     if (process.env.YOUTUBE_COOKIES) {
       try {
-        const cookieLines = ["# Netscape HTTP Cookie File"];
+        let cookieContent = "# Netscape HTTP Cookie File\n";
         process.env.YOUTUBE_COOKIES.split(";").forEach(c => {
-          const parts = c.trim().split("=");
-          if (parts.length >= 2) {
-            const name = parts[0].trim();
-            const value = parts.slice(1).join("=").trim();
-            cookieLines.push(".youtube.com\tTRUE\t/\tTRUE\t9999999999\t" + name + "\t" + value);
+          const eqIdx = c.indexOf("=");
+          if (eqIdx > 0) {
+            const name = c.slice(0, eqIdx).trim();
+            const value = c.slice(eqIdx + 1).trim();
+            cookieContent += ".youtube.com\tTRUE\t/\tTRUE\t9999999999\t" + name + "\t" + value + "\n";
           }
         });
-        fs.writeFileSync(cookiesPath, cookieLines.join("\n"));
+        fs.writeFileSync(cookiesPath, cookieContent);
         args.unshift("--cookies", cookiesPath);
+        log("Using YouTube cookies for download", "info");
       } catch (e) { log("Cookie write error: " + e.message, "warn"); }
+    } else {
+      log("No YOUTUBE_COOKIES set — download may be blocked by YouTube", "warn");
     }
 
     const timer = setTimeout(() => {
       cleanFile(outputPath);
       cleanFile(cookiesPath);
-      reject(new Error("yt-dlp download timeout after 120s"));
+      reject(new Error("yt-dlp timeout after 120s"));
     }, 120000);
 
-    execFile("yt-dlp", args, (error, stdout, stderr) => {
+    execFile(ytdlpBin, args, { maxBuffer: 1024 * 1024 * 50 }, (error, stdout, stderr) => {
       clearTimeout(timer);
       cleanFile(cookiesPath);
       if (error) {
         cleanFile(outputPath);
-        reject(new Error("yt-dlp error: " + (stderr || error.message)));
+        reject(new Error("yt-dlp error: " + (stderr || error.message).slice(0, 200)));
         return;
       }
       if (!fs.existsSync(outputPath)) {
-        reject(new Error("yt-dlp: file not created"));
+        reject(new Error("yt-dlp: output file not created"));
         return;
       }
       log("Download complete: " + outputPath, "success");
