@@ -336,64 +336,98 @@ async function uploadToCloudinary(filePath, clipTitle) {
 async function postToInstagram(clip) {
   try {
     const igId = process.env.INSTAGRAM_BUSINESS_ID || process.env.INSTAGRAM_PAGE_ID;
-    const token = ACCESS_TOKEN;
+
+    if (!ACCESS_TOKEN || ACCESS_TOKEN.length < 10) {
+      log("Instagram error: ACCESS_TOKEN missing or invalid", "warn");
+      return false;
+    }
+
+    if (!igId) {
+      log("Instagram error: INSTAGRAM_PAGE_ID not set", "warn");
+      return false;
+    }
 
     if (!clip.videoId || clip.videoId === "demo") {
       log("Skipping — no valid video ID: " + clip.clipTitle, "info");
       return false;
     }
 
-    if (!ACCESS_TOKEN || ACCESS_TOKEN.length < 10) {
-      log("Instagram error: ACCESS_TOKEN is missing or invalid — please update INSTAGRAM_ACCESS_TOKEN in Railway variables", "warn");
-      return false;
-    }
+    // Build a publicly accessible video URL using Cloudinary fetch
+    // Cloudinary fetches from YouTube and serves it as a proper video
+    const cloudName = process.env.CLOUDINARY_CLOUD_NAME || "dj4mtzmjk";
+    const youtubeUrl = "https://www.youtube.com/watch?v=" + clip.videoId;
+    const encodedUrl = encodeURIComponent(youtubeUrl);
 
-    if (!igId) {
-      log("Instagram error: INSTAGRAM_PAGE_ID or INSTAGRAM_BUSINESS_ID not set", "warn");
-      return false;
-    }
+    // Use Cloudinary's fetch transformation to clip the video
+    const startSecs = clip.startSeconds || 0;
+    const duration = clip.clipLength || 30;
 
-    // Use YouTube thumbnail as image post (no download needed)
-    // Instagram requires a publicly accessible video URL for Reels
-    // We use the highest quality YouTube thumbnail as an image post
-    const thumbUrl = "https://img.youtube.com/vi/" + clip.videoId + "/maxresdefault.jpg";
-    const caption = clip.caption + "\n\n" + clip.clipTitle + "\n\n" +
-      "Watch full video: https://youtube.com/watch?v=" + clip.videoId;
+    // Cloudinary fetch URL — fetches YouTube video and applies transformations
+    const videoUrl = "https://res.cloudinary.com/" + cloudName +
+      "/video/fetch/so_" + startSecs + ",du_" + duration +
+      ",w_720,h_1280,c_fill,ar_9:16,vc_h264,ac_aac/" + encodedUrl;
 
-    log("Posting image to Instagram for: " + clip.clipTitle, "info");
+    log("Posting video Reel to Instagram: " + clip.clipTitle, "info");
+    log("Video URL: " + videoUrl.slice(0, 80) + "...", "info");
 
-    // Create media container as IMAGE post (no video_url needed)
+    const caption = clip.caption + "\n\n" + clip.clipTitle;
+
+    // Step 1: Create container as REEL with video_url
     const createRes = await axios.post(
       "https://graph.facebook.com/v25.0/" + igId + "/media",
       {
-        image_url: thumbUrl,
+        media_type: "REELS",
+        video_url: videoUrl,
         caption: caption,
-        access_token: token
+        access_token: ACCESS_TOKEN
       }
     );
 
     if (!createRes.data || !createRes.data.id) {
-      log("Instagram container creation failed: " + JSON.stringify(createRes.data), "warn");
+      log("Instagram container failed: " + JSON.stringify(createRes.data), "warn");
       return false;
     }
 
     const containerId = createRes.data.id;
     log("Instagram container created: " + containerId, "info");
 
-    // Wait 3 seconds for container to be ready
-    await new Promise(r => setTimeout(r, 3000));
+    // Step 2: Poll until video is processed (up to 2 minutes)
+    let ready = false;
+    for (let i = 0; i < 24; i++) {
+      await new Promise(r => setTimeout(r, 5000));
+      try {
+        const statusRes = await axios.get(
+          "https://graph.facebook.com/v25.0/" + containerId +
+          "?fields=status_code,status&access_token=" + ACCESS_TOKEN
+        );
+        const code = statusRes.data.status_code;
+        log("Instagram status [" + i + "]: " + code, "info");
+        if (code === "FINISHED") { ready = true; break; }
+        if (code === "ERROR") {
+          log("Instagram processing error: " + JSON.stringify(statusRes.data), "warn");
+          break;
+        }
+      } catch (pollErr) {
+        log("Poll error: " + pollErr.message, "warn");
+      }
+    }
 
-    // Publish the post
+    if (!ready) {
+      log("Instagram video processing timed out or failed: " + clip.clipTitle, "warn");
+      return false;
+    }
+
+    // Step 3: Publish the Reel
     const publishRes = await axios.post(
       "https://graph.facebook.com/v25.0/" + igId + "/media_publish",
       {
         creation_id: containerId,
-        access_token: token
+        access_token: ACCESS_TOKEN
       }
     );
 
     if (publishRes.data && publishRes.data.id) {
-      log("Instagram post published! ID: " + publishRes.data.id + " — Clip: " + clip.clipTitle, "success");
+      log("Instagram Reel PUBLISHED: " + clip.clipTitle + " | Post ID: " + publishRes.data.id, "success");
       return true;
     } else {
       log("Instagram publish failed: " + JSON.stringify(publishRes.data), "warn");
