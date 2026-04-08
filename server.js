@@ -610,10 +610,40 @@ async function scanChannel(channel) {
         if (channel.autoPost) await postClip(clip, channel);
       }
     }
-  } catch (err) { log("Scan error: " + err.message, "error"); }
-  channel.status = "active";
-  saveData();
+  try {
+  // your logic here
 }
+catch (err) {
+
+  let msg = "Unknown error";
+
+  try {
+    if (err.response) {
+      if (err.response.data) {
+        if (typeof err.response.data === "string") {
+          msg = err.response.data;
+        } else if (err.response.data.error) {
+          msg = err.response.data.error.message || JSON.stringify(err.response.data.error);
+        } else {
+          msg = JSON.stringify(err.response.data);
+        }
+      } else {
+        msg = "Empty response from Instagram";
+      }
+    } else if (err.request) {
+      msg = "No response received from Instagram";
+    } else {
+      msg = err.message;
+    }
+  } catch (parseErr) {
+    msg = "Error parsing Instagram response: " + parseErr.message;
+  }
+
+  log("Instagram error: " + msg, "warn");
+  return false;
+
+}
+
 
 async function postClip(clip, channel) {
   if (!channel) return;
