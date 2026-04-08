@@ -314,34 +314,56 @@ async function downloadYouTubeVideo(videoId) {
   if (!ytdlpBin) throw new Error("yt-dlp not found on this server. Please ensure it is installed.");
 
   log("Downloading video: " + videoId, "info");
+
+  // Build args — use Android client to bypass bot detection without needing cookies
+  const args = [
+    "--no-playlist",
+    "--format", "worst[ext=mp4]/worst",
+    "--output", outputPath,
+    "--no-warnings",
+    "--quiet",
+    "--no-check-certificate",
+    // Use Android client — bypasses bot check without cookies
+    "--extractor-args", "youtube:player_client=android",
+    "--user-agent", "com.google.android.youtube/17.36.4 (Linux; U; Android 12; GB) gzip",
+    videoUrl
+  ];
+
+  // If user has provided cookies as env var, write them and use them too
+  const cookiesPath = "/tmp/yt_cookies_" + uuidv4() + ".txt";
+  if (process.env.YOUTUBE_COOKIES) {
+    try {
+      let cookieContent = "# Netscape HTTP Cookie File\n";
+      process.env.YOUTUBE_COOKIES.split(";").forEach(c => {
+        const eqIdx = c.indexOf("=");
+        if (eqIdx > 0) {
+          const name = c.slice(0, eqIdx).trim();
+          const value = c.slice(eqIdx + 1).trim();
+          cookieContent += ".youtube.com\tTRUE\t/\tTRUE\t9999999999\t" + name + "\t" + value + "\n";
+        }
+      });
+      fs.writeFileSync(cookiesPath, cookieContent);
+      args.unshift("--cookies", cookiesPath);
+      log("Using YouTube cookies for download", "info");
+    } catch (e) { log("Cookie write error: " + e.message, "warn"); }
+  }
+
   return new Promise((resolve, reject) => {
-    const args = ["--no-playlist", "--format", "worst[ext=mp4]/worst", "--output", outputPath, "--no-warnings", "--quiet", "--no-check-certificate", videoUrl];
-
-    const cookiesPath = "/tmp/yt_cookies_" + uuidv4() + ".txt";
-    if (process.env.YOUTUBE_COOKIES) {
-      try {
-        let cookieContent = "# Netscape HTTP Cookie File\n";
-        process.env.YOUTUBE_COOKIES.split(";").forEach(c => {
-          const eqIdx = c.indexOf("=");
-          if (eqIdx > 0) {
-            const name = c.slice(0, eqIdx).trim();
-            const value = c.slice(eqIdx + 1).trim();
-            cookieContent += ".youtube.com\tTRUE\t/\tTRUE\t9999999999\t" + name + "\t" + value + "\n";
-          }
-        });
-        fs.writeFileSync(cookiesPath, cookieContent);
-        args.unshift("--cookies", cookiesPath);
-        log("Using YouTube cookies for download", "info");
-      } catch (e) { log("Cookie write error: " + e.message, "warn"); }
-    } else {
-      log("No YOUTUBE_COOKIES set — download may be blocked by YouTube", "warn");
-    }
-
     const timer = setTimeout(() => { cleanFile(outputPath); cleanFile(cookiesPath); reject(new Error("yt-dlp timeout after 120s")); }, 120000);
     execFile(ytdlpBin, args, { maxBuffer: 1024 * 1024 * 100 }, (error, stdout, stderr) => {
       clearTimeout(timer);
       cleanFile(cookiesPath);
-      if (error) { cleanFile(outputPath); reject(new Error("yt-dlp error: " + (stderr || error.message).slice(0, 200))); return; }
+      if (error) {
+        cleanFile(outputPath);
+        const errMsg = (stderr || error.message || "").slice(0, 300);
+        // If android client also fails, give clear instructions
+        if (errMsg.includes("Sign in") || errMsg.includes("bot")) {
+          reject(new Error("YouTube blocked download. Add YOUTUBE_COOKIES env variable with your YouTube cookies to fix this."));
+        } else {
+          reject(new Error("yt-dlp error: " + errMsg));
+        }
+        return;
+      }
       if (!fs.existsSync(outputPath) || fs.statSync(outputPath).size === 0) { reject(new Error("yt-dlp: output file missing or empty")); return; }
       log("Download complete: " + outputPath, "success");
       resolve(outputPath);
