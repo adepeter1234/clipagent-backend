@@ -375,16 +375,35 @@ async function uploadToCloudinary(filePath, clipTitle) {
 // ============================================================
 // POST TO INSTAGRAM AS REEL — VIDEO ONLY, NO IMAGES EVER
 // ============================================================
-async function postToInstagram(clip) {
-  let rawVideoPath = null;
-  let clipVideoPath = null;
+} catch (err) {
+  let msg = "Unknown error";
 
   try {
-    const igId = process.env.INSTAGRAM_BUSINESS_ID || process.env.INSTAGRAM_PAGE_ID;
-    const token = process.env.INSTAGRAM_ACCESS_TOKEN;
+    if (err.response) {
+      if (err.response.data) {
+        if (typeof err.response.data === "string") {
+          msg = err.response.data;
+        } else if (err.response.data.error) {
+          msg = err.response.data.error.message || JSON.stringify(err.response.data.error);
+        } else {
+          msg = JSON.stringify(err.response.data);
+        }
+      } else {
+        msg = "Empty response from Instagram";
+      }
+    } else if (err.request) {
+      msg = "No response received from Instagram (network issue)";
+    } else {
+      msg = err.message;
+    }
+  } catch (parseErr) {
+    msg = "Error parsing Instagram response: " + parseErr.message;
+  }
 
-    if (!clip.videoId || clip.videoId === "demo") { log("Skipping — no valid video ID", "info"); return false; }
-    if (!igId || !token) { log("Instagram error: missing credentials", "warn"); return false; }
+  log("Instagram error: " + msg, "warn");
+  return false;
+}
+
 
     // Step 1: Download full video
     // ============================================================
