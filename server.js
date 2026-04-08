@@ -294,47 +294,76 @@ async function uploadToCloudinary(filePath, clipTitle) {
 }
 
 async function postToInstagram(clip) {
-  let rawVideoPath = null;
-  let clippedVideoPath = null;
   try {
     const igId = process.env.INSTAGRAM_BUSINESS_ID || process.env.INSTAGRAM_PAGE_ID;
     const token = process.env.INSTAGRAM_ACCESS_TOKEN;
-    if (!clip.videoId || clip.videoId === "demo") { log("Skipping — no valid video ID: " + clip.clipTitle, "info"); return false; }
 
-    rawVideoPath = await downloadYouTubeVideo(clip.videoId);
-    clippedVideoPath = await cutVideoClip(rawVideoPath, clip.startSeconds || 0, clip.clipLength || 30);
-    const videoUrl = await uploadToCloudinary(clippedVideoPath, clip.clipTitle);
+    if (!clip.videoId || clip.videoId === "demo") {
+      log("Skipping — no valid video ID: " + clip.clipTitle, "info");
+      return false;
+    }
 
-    log("Posting Reel to Instagram: " + clip.clipTitle, "info");
-    const createRes = await axios.post("https://graph.facebook.com/v25.0/" + igId + "/media", { media_type: "REELS", video_url: videoUrl, caption: clip.caption + "\n\n" + clip.clipTitle, access_token: token });
-    if (!createRes.data.id) throw new Error("Failed to create Instagram media container");
+    if (!igId || !token) {
+      log("Instagram error: missing INSTAGRAM_PAGE_ID or ACCESS_TOKEN", "warn");
+      return false;
+    }
+
+    // Use YouTube thumbnail as image post (no download needed)
+    // Instagram requires a publicly accessible video URL for Reels
+    // We use the highest quality YouTube thumbnail as an image post
+    const thumbUrl = "https://img.youtube.com/vi/" + clip.videoId + "/maxresdefault.jpg";
+    const caption = clip.caption + "\n\n" + clip.clipTitle + "\n\n" +
+      "Watch full video: https://youtube.com/watch?v=" + clip.videoId;
+
+    log("Posting image to Instagram for: " + clip.clipTitle, "info");
+
+    // Create media container as IMAGE post (no video_url needed)
+    const createRes = await axios.post(
+      "https://graph.facebook.com/v25.0/" + igId + "/media",
+      {
+        image_url: thumbUrl,
+        caption: caption,
+        access_token: token
+      }
+    );
+
+    if (!createRes.data || !createRes.data.id) {
+      log("Instagram container creation failed: " + JSON.stringify(createRes.data), "warn");
+      return false;
+    }
 
     const containerId = createRes.data.id;
     log("Instagram container created: " + containerId, "info");
 
-    let ready = false;
-    for (let i = 0; i < 18; i++) {
-      await new Promise(r => setTimeout(r, 5000));
-      try {
-        const statusRes = await axios.get("https://graph.facebook.com/v25.0/" + containerId + "?fields=status_code&access_token=" + token);
-        log("Instagram status: " + statusRes.data.status_code, "info");
-        if (statusRes.data.status_code === "FINISHED") { ready = true; break; }
-        if (statusRes.data.status_code === "ERROR") throw new Error("Instagram video processing failed");
-      } catch (pollErr) { log("Poll error: " + pollErr.message, "warn"); }
+    // Wait 3 seconds for container to be ready
+    await new Promise(r => setTimeout(r, 3000));
+
+    // Publish the post
+    const publishRes = await axios.post(
+      "https://graph.facebook.com/v25.0/" + igId + "/media_publish",
+      {
+        creation_id: containerId,
+        access_token: token
+      }
+    );
+
+    if (publishRes.data && publishRes.data.id) {
+      log("Instagram post published! ID: " + publishRes.data.id + " — Clip: " + clip.clipTitle, "success");
+      return true;
+    } else {
+      log("Instagram publish failed: " + JSON.stringify(publishRes.data), "warn");
+      return false;
     }
 
-    if (!ready) throw new Error("Instagram video processing timed out");
-    const publishRes = await axios.post("https://graph.facebook.com/v25.0/" + igId + "/media_publish", { creation_id: containerId, access_token: token });
-    if (publishRes.data.id) { log("Instagram Reel published: " + clip.clipTitle, "success"); return true; }
   } catch (err) {
-    const msg = err.response && err.response.data && err.response.data.error ? err.response.data.error.message : err.message;
+    const msg = err.response && err.response.data && err.response.data.error
+      ? err.response.data.error.message
+      : err.message;
     log("Instagram error: " + msg, "warn");
     return false;
-  } finally {
-    cleanFile(rawVideoPath);
-    cleanFile(clippedVideoPath);
   }
 }
+
 
 async function scanChannel(channel) {
   log("Scanning: " + channel.name, "info");
