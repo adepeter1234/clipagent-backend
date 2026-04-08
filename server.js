@@ -1,4 +1,7 @@
 require("dotenv").config();
+
+// Global persistent access token
+let ACCESS_TOKEN = process.env.INSTAGRAM_ACCESS_TOKEN || "";
 const express = require("express");
 const axios = require("axios");
 const cron = require("node-cron");
@@ -32,12 +35,47 @@ let clips = [];
 let logs = [];
 
 // ================================================
+// PERSISTENT STORAGE — survives Railway restarts
+// ================================================
+const DATA_FILE = "/tmp/clipagent_data.json";
+
+function saveData() {
+  try {
+    const data = {
+      channels,
+      clips: clips.slice(0, 200),
+      accessToken: ACCESS_TOKEN
+    };
+    require("fs").writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
+  } catch (e) {
+    log("saveData error: " + e.message, "warn");
+  }
+}
+
+function loadData() {
+  try {
+    if (require("fs").existsSync(DATA_FILE)) {
+      const data = JSON.parse(require("fs").readFileSync(DATA_FILE, "utf8"));
+      if (data.channels) channels = data.channels;
+      if (data.clips) clips = data.clips;
+      if (data.accessToken && data.accessToken.length > 10) {
+        ACCESS_TOKEN = data.accessToken;
+        log("Loaded saved Instagram token from storage", "success");
+      }
+      log("Data loaded: " + channels.length + " channels, " + clips.length + " clips", "success");
+    }
+  } catch (e) {
+    log("loadData error: " + e.message, "warn");
+  }
+}
+
+// ================================================
 // GLOBAL THROTTLE SYSTEM
 // ================================================
 let lastPostTime = 0;
 let lastScanTime = 0;
-const MIN_POST_GAP_MS = 30 * 60 * 1000;
-const MIN_SCAN_GAP_MS = 60 * 60 * 1000;
+const MIN_POST_GAP_MS = 30 * 60 * 1000;  // 30 minutes between posts
+const MIN_SCAN_GAP_MS = 60 * 60 * 1000;  // 1 hour between scans
 
 async function waitForPostSlot() {
   const now = Date.now();
@@ -86,6 +124,7 @@ app.post("/api/channels", async (req, res) => {
     const info = await getYouTubeChannelInfo(handle);
     const channel = { id: Date.now().toString(), url, name: name || info.name || handle, ytId: info.ytId || handle, clipLength: parseInt(clipLength), postTo, autoPost: Boolean(autoPost), status: "active", clipsGenerated: 0, postsPublished: 0, lastScanned: null, addedAt: new Date().toISOString() };
     channels.push(channel);
+    saveData();
     log("Channel added: " + channel.name, "success");
     res.json(channel);
   } catch (err) { log("Add channel error: " + err.message, "error"); res.status(500).json({ error: err.message }); }
@@ -95,6 +134,7 @@ app.delete("/api/channels/:id", (req, res) => {
   const ch = channels.find(c => c.id === req.params.id);
   if (!ch) return res.status(404).json({ error: "Not found" });
   channels = channels.filter(c => c.id !== req.params.id);
+  saveData();
   log("Channel removed: " + ch.name, "warn");
   res.json({ success: true });
 });
@@ -142,8 +182,8 @@ app.post("/api/scan", async (req, res) => {
 
 app.post("/api/refresh-token", async (req, res) => {
   try {
-    const r = await axios.get("https://graph.facebook.com/v25.0/oauth/access_token", { params: { grant_type: "fb_exchange_token", client_id: process.env.FACEBOOK_APP_ID, client_secret: process.env.FACEBOOK_APP_SECRET, fb_exchange_token: process.env.INSTAGRAM_ACCESS_TOKEN } });
-    if (r.data.access_token) { process.env.INSTAGRAM_ACCESS_TOKEN = r.data.access_token; log("Token refreshed", "success"); res.json({ success: true }); }
+    const r = await axios.get("https://graph.facebook.com/v25.0/oauth/access_token", { params: { grant_type: "fb_exchange_token", client_id: process.env.FACEBOOK_APP_ID, client_secret: process.env.FACEBOOK_APP_SECRET, fb_exchange_token: ACCESS_TOKEN } });
+    if (r.data.access_token) { ACCESS_TOKEN = r.data.access_token; log("Token refreshed", "success"); res.json({ success: true }); }
     else res.status(400).json({ error: "Could not refresh" });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -178,181 +218,197 @@ async function analyzeWithClaude(channel, videoTitle) {
   } catch (err) { log("Claude error: " + err.message, "warn"); return []; }
 }
 
+// ================================================
+// DOWNLOAD USING yt-dlp (installed via nixpacks)
+// No npm package needed — uses system binary
+// ================================================
+// Find yt-dlp binary in common locations
 function findYtDlp() {
-  const locations = ["yt-dlp", "/usr/local/bin/yt-dlp", "/usr/bin/yt-dlp", "/home/user/.local/bin/yt-dlp"];
+  const locations = [
+    "yt-dlp",
+    "/usr/local/bin/yt-dlp",
+    "/usr/bin/yt-dlp",
+    "/home/user/.local/bin/yt-dlp"
+  ];
   for (const loc of locations) {
-    try { require("child_process").execFileSync(loc, ["--version"], { timeout: 5000 }); log("Found yt-dlp at: " + loc, "info"); return loc; } catch(e) {}
+    try {
+      require("child_process").execFileSync(loc, ["--version"], { timeout: 5000 });
+      log("Found yt-dlp at: " + loc, "info");
+      return loc;
+    } catch(e) {}
   }
   return null;
 }
 
-// ================================================
-// DOWNLOAD + CUT + UPLOAD TO CLOUDINARY
-// Returns a publicly accessible video URL for Instagram
-// ================================================
-async function prepareClipForInstagram(clip) {
+async function downloadYouTubeVideo(videoId) {
+  const outputPath = path.join("/tmp", uuidv4() + "_raw.mp4");
+  const videoUrl = "https://www.youtube.com/watch?v=" + videoId;
+  log("Downloading via yt-dlp: " + videoId, "info");
+
   const ytdlpBin = findYtDlp();
-  if (!ytdlpBin) throw new Error("yt-dlp not found. Cannot download video.");
-
-  const rawPath = path.join("/tmp", uuidv4() + "_raw.mp4");
-  const clipPath = path.join("/tmp", uuidv4() + "_clip.mp4");
-  const videoUrl = "https://www.youtube.com/watch?v=" + clip.videoId;
-
-  log("Downloading video for clip: " + clip.clipTitle, "info");
-
-  try {
-    // Step 1: Download full video via yt-dlp
-    await new Promise((resolve, reject) => {
-      const args = [
-        "--no-playlist",
-        "--format", "worst[ext=mp4]/worst",
-        "--output", rawPath,
-        "--no-warnings",
-        "--quiet",
-        "--no-check-certificate",
-        videoUrl
-      ];
-
-      // Add cookies if available
-      const cookiesPath = "/tmp/yt_cookies_" + uuidv4() + ".txt";
-      if (process.env.YOUTUBE_COOKIES) {
-        try {
-          let cookieContent = "# Netscape HTTP Cookie File\n";
-          process.env.YOUTUBE_COOKIES.split(";").forEach(c => {
-            const eqIdx = c.indexOf("=");
-            if (eqIdx > 0) {
-              const name = c.slice(0, eqIdx).trim();
-              const value = c.slice(eqIdx + 1).trim();
-              cookieContent += ".youtube.com\tTRUE\t/\tTRUE\t9999999999\t" + name + "\t" + value + "\n";
-            }
-          });
-          fs.writeFileSync(cookiesPath, cookieContent);
-          args.unshift("--cookies", cookiesPath);
-        } catch (e) { log("Cookie write error: " + e.message, "warn"); }
-      }
-
-      const timer = setTimeout(() => { cleanFile(rawPath); cleanFile(cookiesPath); reject(new Error("yt-dlp timeout")); }, 120000);
-      execFile(ytdlpBin, args, { maxBuffer: 1024 * 1024 * 100 }, (error, stdout, stderr) => {
-        clearTimeout(timer);
-        cleanFile(cookiesPath);
-        if (error) { cleanFile(rawPath); reject(new Error("yt-dlp error: " + (stderr || error.message).slice(0, 200))); return; }
-        if (!fs.existsSync(rawPath)) { reject(new Error("yt-dlp: output file not created")); return; }
-        log("Video downloaded: " + rawPath, "success");
-        resolve();
-      });
-    });
-
-    // Step 2: Cut the clip with ffmpeg
-    log("Cutting clip: start=" + (clip.startSeconds || 0) + "s duration=" + (clip.clipLength || 30) + "s", "info");
-    await new Promise((resolve, reject) => {
-      ffmpeg(rawPath)
-        .setStartTime(clip.startSeconds || 0)
-        .setDuration(clip.clipLength || 30)
-        .videoCodec("libx264")
-        .audioCodec("aac")
-        .outputOptions([
-          "-preset ultrafast",
-          "-crf 28",
-          "-vf scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2",
-          "-movflags +faststart",
-          "-pix_fmt yuv420p"
-        ])
-        .output(clipPath)
-        .on("end", () => { log("Clip cut done", "success"); resolve(); })
-        .on("error", (err) => { cleanFile(clipPath); reject(new Error("FFmpeg error: " + err.message)); })
-        .run();
-      setTimeout(() => { cleanFile(clipPath); reject(new Error("FFmpeg timeout")); }, 180000);
-    });
-
-    // Step 3: Upload clip to Cloudinary to get public HTTPS URL
-    log("Uploading clip to Cloudinary: " + clip.clipTitle, "info");
-    const cloudinaryUrl = await new Promise((resolve, reject) => {
-      cloudinary.uploader.upload(clipPath, {
-        resource_type: "video",
-        public_id: "clipagent_" + Date.now(),
-        folder: "clipagent",
-        overwrite: true
-      }, (error, result) => {
-        if (error) reject(new Error("Cloudinary error: " + error.message));
-        else { log("Cloudinary upload done: " + result.secure_url, "success"); resolve(result.secure_url); }
-      });
-    });
-
-    return cloudinaryUrl;
-
-  } finally {
-    cleanFile(rawPath);
-    cleanFile(clipPath);
+  if (!ytdlpBin) {
+    throw new Error("yt-dlp not found on this server. Please ensure it is installed.");
   }
+
+  return new Promise((resolve, reject) => {
+    const args = [
+      "--no-playlist",
+      "--format", "worst[ext=mp4]/worst",
+      "--output", outputPath,
+      "--no-warnings",
+      "--quiet",
+      "--no-check-certificate",
+      videoUrl
+    ];
+
+    const cookiesPath = "/tmp/yt_cookies.txt";
+    if (process.env.YOUTUBE_COOKIES) {
+      try {
+        let cookieContent = "# Netscape HTTP Cookie File\n";
+        process.env.YOUTUBE_COOKIES.split(";").forEach(c => {
+          const eqIdx = c.indexOf("=");
+          if (eqIdx > 0) {
+            const name = c.slice(0, eqIdx).trim();
+            const value = c.slice(eqIdx + 1).trim();
+            cookieContent += ".youtube.com\tTRUE\t/\tTRUE\t9999999999\t" + name + "\t" + value + "\n";
+          }
+        });
+        fs.writeFileSync(cookiesPath, cookieContent);
+        args.unshift("--cookies", cookiesPath);
+        log("Using YouTube cookies for download", "info");
+      } catch (e) { log("Cookie write error: " + e.message, "warn"); }
+    } else {
+      log("No YOUTUBE_COOKIES set — download may be blocked by YouTube", "warn");
+    }
+
+    const timer = setTimeout(() => {
+      cleanFile(outputPath);
+      cleanFile(cookiesPath);
+      reject(new Error("yt-dlp timeout after 120s"));
+    }, 120000);
+
+    execFile(ytdlpBin, args, { maxBuffer: 1024 * 1024 * 50 }, (error, stdout, stderr) => {
+      clearTimeout(timer);
+      cleanFile(cookiesPath);
+      if (error) {
+        cleanFile(outputPath);
+        reject(new Error("yt-dlp error: " + (stderr || error.message).slice(0, 200)));
+        return;
+      }
+      if (!fs.existsSync(outputPath)) {
+        reject(new Error("yt-dlp: output file not created"));
+        return;
+      }
+      log("Download complete: " + outputPath, "success");
+      resolve(outputPath);
+    });
+  });
 }
 
-// ================================================
-// POST TO INSTAGRAM AS REEL (video only)
-// ================================================
+async function cutVideoClip(inputPath, startSeconds, duration) {
+  const outputPath = path.join("/tmp", uuidv4() + "_clip.mp4");
+  const start = startSeconds || 0;
+  const clipDuration = duration || 30;
+  log("Cutting clip: start=" + start + "s duration=" + clipDuration + "s", "info");
+  return new Promise((resolve, reject) => {
+    ffmpeg(inputPath).setStartTime(start).setDuration(clipDuration).videoCodec("libx264").audioCodec("aac")
+      .outputOptions(["-preset ultrafast", "-crf 28", "-vf scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2", "-movflags +faststart", "-pix_fmt yuv420p"])
+      .output(outputPath)
+      .on("end", () => { log("Clip ready: " + outputPath, "success"); resolve(outputPath); })
+      .on("error", (err) => { cleanFile(outputPath); reject(new Error("FFmpeg error: " + err.message)); })
+      .run();
+    setTimeout(() => { cleanFile(outputPath); reject(new Error("FFmpeg timeout")); }, 180000);
+  });
+}
+
+async function uploadToCloudinary(filePath, clipTitle) {
+  log("Uploading to Cloudinary: " + clipTitle, "info");
+  return new Promise((resolve, reject) => {
+    cloudinary.uploader.upload(filePath, { resource_type: "video", public_id: "clipagent_" + Date.now(), folder: "clipagent", overwrite: true },
+      (error, result) => {
+        if (error) reject(new Error("Cloudinary error: " + error.message));
+        else { log("Cloudinary done: " + result.secure_url, "success"); resolve(result.secure_url); }
+      }
+    );
+  });
+}
+
 async function postToInstagram(clip) {
   try {
     const igId = process.env.INSTAGRAM_BUSINESS_ID || process.env.INSTAGRAM_PAGE_ID;
-    const token = process.env.INSTAGRAM_ACCESS_TOKEN;
+    const token = ACCESS_TOKEN;
 
-    if (!clip.videoId || clip.videoId === "demo") { log("Skipping — no valid video ID: " + clip.clipTitle, "info"); return false; }
-    if (!igId || !token) { log("Instagram error: missing INSTAGRAM_PAGE_ID or ACCESS_TOKEN", "warn"); return false; }
+    if (!clip.videoId || clip.videoId === "demo") {
+      log("Skipping — no valid video ID: " + clip.clipTitle, "info");
+      return false;
+    }
 
-    // Download, cut, and upload to get a real video URL
-    const videoUrl = await prepareClipForInstagram(clip);
+    if (!ACCESS_TOKEN || ACCESS_TOKEN.length < 10) {
+      log("Instagram error: ACCESS_TOKEN is missing or invalid — please update INSTAGRAM_ACCESS_TOKEN in Railway variables", "warn");
+      return false;
+    }
 
-    const caption = clip.caption + "\n\n" + clip.clipTitle;
-    log("Posting Reel to Instagram: " + clip.clipTitle, "info");
+    if (!igId) {
+      log("Instagram error: INSTAGRAM_PAGE_ID or INSTAGRAM_BUSINESS_ID not set", "warn");
+      return false;
+    }
 
-    // Create Reel container
+    // Use YouTube thumbnail as image post (no download needed)
+    // Instagram requires a publicly accessible video URL for Reels
+    // We use the highest quality YouTube thumbnail as an image post
+    const thumbUrl = "https://img.youtube.com/vi/" + clip.videoId + "/maxresdefault.jpg";
+    const caption = clip.caption + "\n\n" + clip.clipTitle + "\n\n" +
+      "Watch full video: https://youtube.com/watch?v=" + clip.videoId;
+
+    log("Posting image to Instagram for: " + clip.clipTitle, "info");
+
+    // Create media container as IMAGE post (no video_url needed)
     const createRes = await axios.post(
       "https://graph.facebook.com/v25.0/" + igId + "/media",
-      { media_type: "REELS", video_url: videoUrl, caption: caption, access_token: token }
+      {
+        image_url: thumbUrl,
+        caption: caption,
+        access_token: token
+      }
     );
 
     if (!createRes.data || !createRes.data.id) {
-      log("Instagram container failed: " + JSON.stringify(createRes.data), "warn");
+      log("Instagram container creation failed: " + JSON.stringify(createRes.data), "warn");
       return false;
     }
 
     const containerId = createRes.data.id;
     log("Instagram container created: " + containerId, "info");
 
-    // Poll until video is processed (up to 90 seconds)
-    let ready = false;
-    for (let i = 0; i < 18; i++) {
-      await new Promise(r => setTimeout(r, 5000));
-      try {
-        const statusRes = await axios.get(
-          "https://graph.facebook.com/v25.0/" + containerId + "?fields=status_code&access_token=" + token
-        );
-        log("Instagram processing status: " + statusRes.data.status_code, "info");
-        if (statusRes.data.status_code === "FINISHED") { ready = true; break; }
-        if (statusRes.data.status_code === "ERROR") throw new Error("Instagram video processing failed");
-      } catch (pollErr) { log("Poll error: " + pollErr.message, "warn"); }
-    }
+    // Wait 3 seconds for container to be ready
+    await new Promise(r => setTimeout(r, 3000));
 
-    if (!ready) throw new Error("Instagram video processing timed out after 90s");
-
-    // Publish the Reel
+    // Publish the post
     const publishRes = await axios.post(
       "https://graph.facebook.com/v25.0/" + igId + "/media_publish",
-      { creation_id: containerId, access_token: token }
+      {
+        creation_id: containerId,
+        access_token: token
+      }
     );
 
     if (publishRes.data && publishRes.data.id) {
-      log("Instagram Reel published! ID: " + publishRes.data.id + " — " + clip.clipTitle, "success");
+      log("Instagram post published! ID: " + publishRes.data.id + " — Clip: " + clip.clipTitle, "success");
       return true;
+    } else {
+      log("Instagram publish failed: " + JSON.stringify(publishRes.data), "warn");
+      return false;
     }
 
-    log("Instagram publish failed: " + JSON.stringify(publishRes.data), "warn");
-    return false;
-
   } catch (err) {
-    const msg = err.response && err.response.data && err.response.data.error ? err.response.data.error.message : err.message;
+    const msg = err.response && err.response.data && err.response.data.error
+      ? err.response.data.error.message
+      : err.message;
     log("Instagram error: " + msg, "warn");
     return false;
   }
 }
+
 
 async function scanChannel(channel) {
   log("Scanning: " + channel.name, "info");
@@ -363,7 +419,10 @@ async function scanChannel(channel) {
     if (!videos.length) { log("No videos found: " + channel.name, "info"); channel.status = "active"; return; }
     let videoIndex = 0;
     for (const video of videos.slice(0, 2)) {
-      if (videoIndex > 0) { log("Scan throttle: 15s delay between videos", "info"); await new Promise(r => setTimeout(r, 15000)); }
+      if (videoIndex > 0) {
+        log("Scan throttle: 15s delay between videos", "info");
+        await new Promise(r => setTimeout(r, 15000));
+      }
       videoIndex++;
       const videoId = video.id && video.id.videoId;
       const title = video.snippet && video.snippet.title;
@@ -389,23 +448,42 @@ async function postClip(clip, channel) {
   try {
     await waitForPostSlot();
     let success = false;
-    if (channel.postTo === "all" || channel.postTo === "instagram") { success = await postToInstagram(clip); }
-    if (success) { clip.status = "posted"; clip.postedAt = new Date().toISOString(); channel.postsPublished++; log("Posted successfully: " + clip.clipTitle, "success"); }
-    else { clip.status = "failed"; log("Post failed: " + clip.clipTitle, "warn"); }
-  } catch (err) { log("Post error: " + err.message, "warn"); clip.status = "failed"; }
+    if (channel.postTo === "all" || channel.postTo === "instagram") {
+      success = await postToInstagram(clip);
+    }
+    if (success) {
+      clip.status = "posted";
+      clip.postedAt = new Date().toISOString();
+      channel.postsPublished++;
+      log("Posted successfully: " + clip.clipTitle, "success");
+    } else {
+      clip.status = "failed";
+      log("Post failed — Instagram returned false: " + clip.clipTitle, "warn");
+    }
+  } catch (err) {
+    log("Post error: " + err.message, "warn");
+    clip.status = "failed";
+  }
 }
 
 cron.schedule("0 * * * *", async () => {
   try {
     const now = Date.now();
     const elapsed = now - lastScanTime;
-    if (elapsed < MIN_SCAN_GAP_MS) { const waitMins = Math.ceil((MIN_SCAN_GAP_MS - elapsed) / 60000); log("Scan throttle: skipping — next scan in " + waitMins + " min", "info"); return; }
+    if (elapsed < MIN_SCAN_GAP_MS) {
+      const waitMins = Math.ceil((MIN_SCAN_GAP_MS - elapsed) / 60000);
+      log("Scan throttle: skipping — next scan in " + waitMins + " min", "info");
+      return;
+    }
     lastScanTime = now;
     const active = channels.filter(c => c.status === "active");
     if (!active.length) return;
     log("Auto-scan: " + active.length + " channel(s)", "info");
     for (let i = 0; i < active.length; i++) {
-      if (i > 0) { log("Channel throttle: 15s delay before next channel", "info"); await new Promise(r => setTimeout(r, 15000)); }
+      if (i > 0) {
+        log("Channel throttle: 15s delay before next channel", "info");
+        await new Promise(r => setTimeout(r, 15000));
+      }
       await scanChannel(active[i]);
     }
   } catch (err) { log("Auto-scan error: " + err.message, "error"); }
@@ -413,13 +491,14 @@ cron.schedule("0 * * * *", async () => {
 
 cron.schedule("0 0 * * *", async () => {
   try {
-    const r = await axios.get("https://graph.facebook.com/v25.0/oauth/access_token", { params: { grant_type: "fb_exchange_token", client_id: process.env.FACEBOOK_APP_ID, client_secret: process.env.FACEBOOK_APP_SECRET, fb_exchange_token: process.env.INSTAGRAM_ACCESS_TOKEN } });
-    if (r.data.access_token) { process.env.INSTAGRAM_ACCESS_TOKEN = r.data.access_token; log("Token auto-refreshed", "success"); }
+    const r = await axios.get("https://graph.facebook.com/v25.0/oauth/access_token", { params: { grant_type: "fb_exchange_token", client_id: process.env.FACEBOOK_APP_ID, client_secret: process.env.FACEBOOK_APP_SECRET, fb_exchange_token: ACCESS_TOKEN } });
+    if (r.data.access_token) { ACCESS_TOKEN = r.data.access_token; saveData(); log("Token auto-refreshed and saved", "success"); }
   } catch (err) { log("Token refresh error: " + err.message, "warn"); }
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
+  loadData();
   log("ClipAgent running on port " + PORT, "success");
   console.log("ClipAgent started on port " + PORT);
 });
