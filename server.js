@@ -387,7 +387,95 @@ async function postToInstagram(clip) {
     if (!igId || !token) { log("Instagram error: missing credentials", "warn"); return false; }
 
     // Step 1: Download full video
-    rawVideoPath = await downloadYouTubeVideo(clip.videoId);
+    // ============================================================
+// DOWNLOAD VIDEO (YouTube + Instagram supported)
+// ============================================================
+async function downloadYouTubeVideo(videoId) {
+  const outputPath = path.join("/tmp", uuidv4() + "_raw.mp4");
+
+  // Support both YouTube IDs and full URLs (Instagram, etc.)
+  const videoUrl = videoId.startsWith("http")
+    ? videoId
+    : "https://www.youtube.com/watch?v=" + videoId;
+
+  const ytdlpBin = findYtDlp();
+  if (!ytdlpBin) throw new Error("yt-dlp not found on this server");
+
+  log("Downloading video: " + videoUrl, "info");
+
+  return new Promise((resolve, reject) => {
+    const args = [
+      "--no-playlist",
+      "--format", "mp4",
+      "--output", outputPath,
+      "--no-warnings",
+      "--quiet",
+      "--no-check-certificate",
+      "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+      "--referer", "https://www.instagram.com/",
+      videoUrl
+    ];
+
+    // ============================================================
+    // UNIVERSAL COOKIE SUPPORT (Instagram + YouTube)
+    // ============================================================
+    const cookiesPath = path.join("/tmp", "yt_cookies_" + uuidv4() + ".txt");
+    const cookiesEnv = process.env.YTDLP_COOKIES;
+
+    if (cookiesEnv) {
+      try {
+        let cookieContent = "# Netscape HTTP Cookie File\n";
+
+        cookiesEnv.split(";").forEach(c => {
+          const eqIdx = c.indexOf("=");
+          if (eqIdx > 0) {
+            const name = c.slice(0, eqIdx).trim();
+            const value = c.slice(eqIdx + 1).trim();
+
+            // Instagram cookies
+            cookieContent += ".instagram.com\tTRUE\t/\tTRUE\t9999999999\t" + name + "\t" + value + "\n";
+
+            // YouTube cookies
+            cookieContent += ".youtube.com\tTRUE\t/\tTRUE\t9999999999\t" + name + "\t" + value + "\n";
+          }
+        });
+
+        fs.writeFileSync(cookiesPath, cookieContent);
+        args.unshift("--cookies", cookiesPath);
+
+        log("Using yt-dlp cookies (Instagram + YouTube)", "info");
+      } catch (e) {
+        log("Cookie write error: " + e.message, "warn");
+      }
+    }
+
+    const timer = setTimeout(() => {
+      cleanFile(outputPath);
+      cleanFile(cookiesPath);
+      reject(new Error("yt-dlp timeout after 120s"));
+    }, 120000);
+
+    execFile(ytdlpBin, args, { maxBuffer: 1024 * 1024 * 100 }, (error, stdout, stderr) => {
+      clearTimeout(timer);
+      cleanFile(cookiesPath);
+
+      if (error) {
+        cleanFile(outputPath);
+        reject(new Error("yt-dlp error: " + (stderr || error.message).slice(0, 300)));
+        return;
+      }
+
+      if (!fs.existsSync(outputPath) || fs.statSync(outputPath).size === 0) {
+        reject(new Error("yt-dlp: output file missing or empty"));
+        return;
+      }
+
+      log("Download complete: " + outputPath, "success");
+      resolve(outputPath);
+    });
+  });
+}
+
 
     // Step 2: Cut to exact clip using user-selected startSeconds and clipLength
     clipVideoPath = await cutVideoClip(rawVideoPath, clip.startSeconds || 0, clip.clipLength || 30);
