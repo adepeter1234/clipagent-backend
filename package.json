@@ -14,6 +14,7 @@
     "cloudinary": "^1.41.0",
     "fluent-ffmpeg": "^2.1.2",
     "@distube/ytdl-core": "^4.16.8",
+    "@ffmpeg-installer/ffmpeg": "^1.1.0",
     "uuid": "^9.0.0"
   }
 }
