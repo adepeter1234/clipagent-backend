@@ -35,44 +35,55 @@ let clips = [];
 let logs = [];
 
 // ================================================
-// PERSISTENT STORAGE
+// PERSISTENT STORAGE — survives Railway restarts
 // ================================================
 const DATA_FILE = "/tmp/clipagent_data.json";
 
 function saveData() {
   try {
-    fs.writeFileSync(DATA_FILE, JSON.stringify({ channels, clips: clips.slice(0, 200), accessToken: ACCESS_TOKEN }, null, 2));
-  } catch (e) { log("saveData error: " + e.message, "warn"); }
+    const data = {
+      channels,
+      clips: clips.slice(0, 200),
+      accessToken: ACCESS_TOKEN
+    };
+    require("fs").writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
+  } catch (e) {
+    log("saveData error: " + e.message, "warn");
+  }
 }
 
 function loadData() {
   try {
-    if (fs.existsSync(DATA_FILE)) {
-      const data = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
+    if (require("fs").existsSync(DATA_FILE)) {
+      const data = JSON.parse(require("fs").readFileSync(DATA_FILE, "utf8"));
       if (data.channels) channels = data.channels;
       if (data.clips) clips = data.clips;
       if (data.accessToken && data.accessToken.length > 10) {
         ACCESS_TOKEN = data.accessToken;
-        log("Loaded saved Instagram token", "success");
+        log("Loaded saved Instagram token from storage", "success");
       }
       log("Data loaded: " + channels.length + " channels, " + clips.length + " clips", "success");
     }
-  } catch (e) { log("loadData error: " + e.message, "warn"); }
+  } catch (e) {
+    log("loadData error: " + e.message, "warn");
+  }
 }
 
 // ================================================
-// THROTTLE
+// GLOBAL THROTTLE SYSTEM
 // ================================================
 let lastPostTime = 0;
 let lastScanTime = 0;
-const MIN_POST_GAP_MS = 30 * 60 * 1000;
-const MIN_SCAN_GAP_MS = 60 * 60 * 1000;
+const MIN_POST_GAP_MS = 30 * 60 * 1000;  // 30 minutes between posts
+const MIN_SCAN_GAP_MS = 60 * 60 * 1000;  // 1 hour between scans
 
 async function waitForPostSlot() {
-  const elapsed = Date.now() - lastPostTime;
+  const now = Date.now();
+  const elapsed = now - lastPostTime;
   if (elapsed < MIN_POST_GAP_MS) {
     const waitMs = MIN_POST_GAP_MS - elapsed;
-    log("Post throttle: waiting " + Math.ceil(waitMs/60000) + " min", "info");
+    const waitMins = Math.ceil(waitMs / 60000);
+    log("Post throttle: waiting " + waitMins + " min before next post", "info");
     await new Promise(r => setTimeout(r, waitMs));
   }
   lastPostTime = Date.now();
@@ -90,11 +101,15 @@ function cleanFile(filePath) {
   try { if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch (e) {}
 }
 
-// ================================================
-// ROUTES
-// ================================================
-app.get("/", (req, res) => res.json({ name: "ClipAgent Backend", status: "running", uptime_seconds: Math.floor(process.uptime()), channels: channels.length, clips: clips.length, posts: clips.filter(c => c.status === "posted").length }));
-app.get("/api/stats", (req, res) => { const posted = clips.filter(c => c.status === "posted").length; res.json({ channels: channels.length, clips: clips.length, posts: posted, earnings: (posted * 250 * 0.0025).toFixed(2) }); });
+app.get("/", (req, res) => {
+  res.json({ name: "ClipAgent Backend", status: "running", uptime_seconds: Math.floor(process.uptime()), channels: channels.length, clips: clips.length, posts: clips.filter(c => c.status === "posted").length });
+});
+
+app.get("/api/stats", (req, res) => {
+  const posted = clips.filter(c => c.status === "posted").length;
+  res.json({ channels: channels.length, clips: clips.length, posts: posted, earnings: (posted * 250 * 0.0025).toFixed(2) });
+});
+
 app.get("/api/logs", (req, res) => res.json(logs.slice(0, 50)));
 app.get("/api/channels", (req, res) => res.json(channels));
 app.get("/api/clips", (req, res) => res.json(clips));
@@ -128,11 +143,13 @@ app.patch("/api/channels/:id/toggle", (req, res) => {
   const ch = channels.find(c => c.id === req.params.id);
   if (!ch) return res.status(404).json({ error: "Not found" });
   ch.status = ch.status === "active" ? "paused" : "active";
-  saveData();
   res.json(ch);
 });
 
-app.delete("/api/clips/:id", (req, res) => { clips = clips.filter(c => c.id !== req.params.id); saveData(); res.json({ success: true }); });
+app.delete("/api/clips/:id", (req, res) => {
+  clips = clips.filter(c => c.id !== req.params.id);
+  res.json({ success: true });
+});
 
 app.post("/api/clips/:id/post", async (req, res) => {
   try {
@@ -166,14 +183,11 @@ app.post("/api/scan", async (req, res) => {
 app.post("/api/refresh-token", async (req, res) => {
   try {
     const r = await axios.get("https://graph.facebook.com/v25.0/oauth/access_token", { params: { grant_type: "fb_exchange_token", client_id: process.env.FACEBOOK_APP_ID, client_secret: process.env.FACEBOOK_APP_SECRET, fb_exchange_token: ACCESS_TOKEN } });
-    if (r.data.access_token) { ACCESS_TOKEN = r.data.access_token; saveData(); log("Token refreshed", "success"); res.json({ success: true }); }
+    if (r.data.access_token) { ACCESS_TOKEN = r.data.access_token; log("Token refreshed", "success"); res.json({ success: true }); }
     else res.status(400).json({ error: "Could not refresh" });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ================================================
-// HELPERS
-// ================================================
 function extractHandle(url) {
   const m = url.match(/youtube\.com\/@([^\/\?&]+)/) || url.match(/youtube\.com\/channel\/([^\/\?&]+)/) || url.match(/youtube\.com\/c\/([^\/\?&]+)/) || url.match(/youtube\.com\/user\/([^\/\?&]+)/);
   return m ? m[1] : url.replace(/.*\//, "").replace("@", "");
@@ -194,172 +208,95 @@ async function getLatestVideos(ytChannelId) {
   } catch (err) { log("Fetch videos error: " + err.message, "warn"); return []; }
 }
 
-// Get video details so Claude can pick truly interesting moments
-async function getVideoDetails(videoId) {
+async function analyzeWithClaude(channel, videoTitle) {
+  const prompt = "You are a viral content expert.\nChannel: \"" + channel.name + "\"\nVideo: \"" + videoTitle + "\"\nClip length: " + channel.clipLength + "s\n\nSuggest 2 clip moments. Respond ONLY in raw JSON no markdown:\n{\"clips\":[{\"title\":\"title\",\"startTime\":\"00:30\",\"endTime\":\"01:30\",\"startSeconds\":30,\"viralScore\":90,\"reason\":\"reason\",\"caption\":\"caption #fyp #viral #shorts\"}]}";
   try {
-    const res = await axios.get("https://www.googleapis.com/youtube/v3/videos", {
-      params: { part: "snippet,contentDetails,statistics", id: videoId, key: process.env.YOUTUBE_API_KEY }
-    });
-    if (res.data.items && res.data.items.length > 0) {
-      const item = res.data.items[0];
-      const dur = item.contentDetails.duration;
-      const match = dur.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/);
-      const totalSeconds = (parseInt(match[1]||0)*3600) + (parseInt(match[2]||0)*60) + (parseInt(match[3]||0));
-      return {
-        description: (item.snippet.description || "").slice(0, 800),
-        totalSeconds,
-        tags: (item.snippet.tags || []).slice(0, 10).join(", ")
-      };
-    }
-  } catch (err) { log("Video details error: " + err.message, "warn"); }
-  return null;
-}
-
-function secondsToTimestamp(s) {
-  const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sec = s%60;
-  return (h>0?String(h).padStart(2,"0")+":":"") + String(m).padStart(2,"0") + ":" + String(sec).padStart(2,"0");
-}
-
-// ================================================
-// AI ANALYSIS — reads video details, avoids intros
-// Never clips from first 20% or last 5%
-// ================================================
-async function analyzeWithClaude(channel, videoId, videoTitle) {
-  const details = await getVideoDetails(videoId);
-  const totalSeconds = details ? details.totalSeconds : 600;
-  const description = details ? details.description : "";
-  const tags = details ? details.tags : "";
-  const clipLen = channel.clipLength;
-  const safeStart = Math.floor(totalSeconds * 0.20);
-  const safeEnd = Math.max(safeStart + clipLen + 60, Math.floor(totalSeconds * 0.95) - clipLen);
-
-  const prompt = `You are a viral short-form video expert. Find the MOST interesting, catchy, emotionally engaging moments for Instagram Reels.
-
-Video: "${videoTitle}"
-Channel: "${channel.name}"
-Total duration: ${totalSeconds}s
-Description: ${description}
-Tags: ${tags}
-Clip length: ${clipLen}s
-
-STRICT RULES:
-- ONLY pick moments between ${safeStart}s and ${safeEnd}s — NEVER from the intro or outro
-- Pick moments that are: funny, shocking, emotional, controversial, surprising, or highly insightful
-- Each clip must be a complete thought — not mid-sentence or mid-action
-- Space the 2 clips at least 90 seconds apart
-
-Respond ONLY in raw JSON, no markdown:
-{"clips":[{"title":"catchy short title","startSeconds":${safeStart},"viralScore":90,"reason":"why this moment is viral","caption":"engaging caption #fyp #viral #shorts #reels"}]}
-
-Suggest exactly 2 clips.`;
-
-  try {
-    const res = await axios.post("https://api.anthropic.com/v1/messages", {
-      model: "claude-sonnet-4-20250514", max_tokens: 1000,
-      messages: [{ role: "user", content: prompt }]
-    }, { headers: { "x-api-key": process.env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "Content-Type": "application/json" } });
-
+    const res = await axios.post("https://api.anthropic.com/v1/messages", { model: "claude-sonnet-4-20250514", max_tokens: 1000, messages: [{ role: "user", content: prompt }] }, { headers: { "x-api-key": process.env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "Content-Type": "application/json" } });
     const raw = res.data.content && res.data.content[0] ? res.data.content[0].text : "{}";
     const parsed = JSON.parse(raw.replace(/```json|```/g, "").trim());
-    return (parsed.clips || []).map(c => {
-      const start = Math.max(safeStart, Math.min(Number(c.startSeconds) || safeStart, safeEnd));
-      return { title: c.title || videoTitle, startSeconds: start, endSeconds: start + clipLen, startTime: secondsToTimestamp(start), endTime: secondsToTimestamp(start + clipLen), viralScore: c.viralScore || 80, reason: c.reason || "", caption: c.caption || "#fyp #viral #shorts" };
-    });
+    return parsed.clips || [];
   } catch (err) { log("Claude error: " + err.message, "warn"); return []; }
 }
 
 // ================================================
-// yt-dlp FINDER
+// DOWNLOAD USING yt-dlp (installed via nixpacks)
+// No npm package needed — uses system binary
 // ================================================
+// Find yt-dlp binary in common locations
 function findYtDlp() {
-  const locations = ["yt-dlp", "/usr/local/bin/yt-dlp", "/usr/bin/yt-dlp", "/home/user/.local/bin/yt-dlp"];
+  const locations = [
+    "yt-dlp",
+    "/usr/local/bin/yt-dlp",
+    "/usr/bin/yt-dlp",
+    "/home/user/.local/bin/yt-dlp"
+  ];
   for (const loc of locations) {
-    try { require("child_process").execFileSync(loc, ["--version"], { timeout: 5000 }); return loc; } catch(e) {}
+    try {
+      require("child_process").execFileSync(loc, ["--version"], { timeout: 5000 });
+      log("Found yt-dlp at: " + loc, "info");
+      return loc;
+    } catch(e) {}
   }
   return null;
 }
 
-// ================================================
-// DOWNLOAD via yt-dlp with cookies + Android client
-// ================================================
 async function downloadYouTubeVideo(videoId) {
   const outputPath = path.join("/tmp", uuidv4() + "_raw.mp4");
   const videoUrl = "https://www.youtube.com/watch?v=" + videoId;
+  log("Downloading via yt-dlp: " + videoId, "info");
+
   const ytdlpBin = findYtDlp();
-  if (!ytdlpBin) throw new Error("yt-dlp not found on this server");
-
-  log("Downloading video: " + videoId, "info");
-
-  // Build cookies file from env var
-  const cookiesPath = "/tmp/yt_cookies_" + uuidv4() + ".txt";
-  let cookiesArg = [];
-
-  if (process.env.YOUTUBE_COOKIES) {
-    try {
-      var rows = [];
-      process.env.YOUTUBE_COOKIES.split(";").forEach(function(pair) {
-        pair = pair.trim();
-        if (!pair) return;
-        var eqIdx = pair.indexOf("=");
-        if (eqIdx < 1) return;
-        var name = pair.slice(0, eqIdx).trim();
-        var value = pair.slice(eqIdx + 1);
-        if (!name) return;
-        rows.push(".youtube.com	TRUE	/	TRUE	2147483647	" + name + "	" + value);
-      });
-      var fileContent = "# Netscape HTTP Cookie File\n# This is a generated file!  Do not edit.\n\n" + rows.join("\n") + "\n";
-      fs.writeFileSync(cookiesPath, fileContent, "utf8");
-      cookiesArg = ["--cookies", cookiesPath];
-      log("Wrote " + rows.length + " cookies from YOUTUBE_COOKIES env", "info");
-    } catch (e) {
-      log("Cookie write error: " + e.message, "warn");
-    }
-  } else {
-    log("No YOUTUBE_COOKIES env set - download may be blocked", "warn");
+  if (!ytdlpBin) {
+    throw new Error("yt-dlp not found on this server. Please ensure it is installed.");
   }
 
-  return new Promise(function(resolve, reject) {
-    var args = [
+  return new Promise((resolve, reject) => {
+    const args = [
       "--no-playlist",
-      "--format", "mp4/bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
-      "--merge-output-format", "mp4",
+      "--format", "worst[ext=mp4]/worst",
       "--output", outputPath,
       "--no-warnings",
       "--quiet",
       "--no-check-certificate",
-      "--extractor-args", "youtube:player_client=android,web",
-      "--user-agent", "com.google.android.youtube/17.36.4 (Linux; U; Android 12; GB) gzip"
+      videoUrl
     ];
 
-    if (cookiesArg.length) {
-      args = args.concat(cookiesArg);
-      log("Using cookies file for authentication", "info");
+    const cookiesPath = "/tmp/yt_cookies.txt";
+    if (process.env.YOUTUBE_COOKIES) {
+      try {
+        let cookieContent = "# Netscape HTTP Cookie File\n";
+        process.env.YOUTUBE_COOKIES.split(";").forEach(c => {
+          const eqIdx = c.indexOf("=");
+          if (eqIdx > 0) {
+            const name = c.slice(0, eqIdx).trim();
+            const value = c.slice(eqIdx + 1).trim();
+            cookieContent += ".youtube.com\tTRUE\t/\tTRUE\t9999999999\t" + name + "\t" + value + "\n";
+          }
+        });
+        fs.writeFileSync(cookiesPath, cookieContent);
+        args.unshift("--cookies", cookiesPath);
+        log("Using YouTube cookies for download", "info");
+      } catch (e) { log("Cookie write error: " + e.message, "warn"); }
+    } else {
+      log("No YOUTUBE_COOKIES set — download may be blocked by YouTube", "warn");
     }
 
-    args.push(videoUrl);
-
-    var timer = setTimeout(function() {
+    const timer = setTimeout(() => {
       cleanFile(outputPath);
       cleanFile(cookiesPath);
       reject(new Error("yt-dlp timeout after 120s"));
     }, 120000);
 
-    execFile(ytdlpBin, args, { maxBuffer: 1024 * 1024 * 100 }, function(error, stdout, stderr) {
+    execFile(ytdlpBin, args, { maxBuffer: 1024 * 1024 * 50 }, (error, stdout, stderr) => {
       clearTimeout(timer);
       cleanFile(cookiesPath);
       if (error) {
         cleanFile(outputPath);
-        var msg = (stderr || error.message || "").slice(0, 400);
-        log("yt-dlp stderr: " + msg, "warn");
-        if (msg.indexOf("Sign in") >= 0 || msg.indexOf("bot") >= 0 || msg.indexOf("confirm") >= 0) {
-          reject(new Error("YouTube bot check failed - update YOUTUBE_COOKIES in Railway env vars"));
-        } else {
-          reject(new Error("yt-dlp error: " + msg));
-        }
+        reject(new Error("yt-dlp error: " + (stderr || error.message).slice(0, 200)));
         return;
       }
-      if (!fs.existsSync(outputPath) || fs.statSync(outputPath).size === 0) {
-        reject(new Error("yt-dlp: output file missing or empty"));
+      if (!fs.existsSync(outputPath)) {
+        reject(new Error("yt-dlp: output file not created"));
         return;
       }
       log("Download complete: " + outputPath, "success");
@@ -368,120 +305,213 @@ async function downloadYouTubeVideo(videoId) {
   });
 }
 
-// ================================================
-// CUT CLIP — exact timestamp, user-selected length
-// ================================================
-async function cutVideoClip(inputPath, startSeconds, clipLength) {
+async function cutVideoClip(inputPath, startSeconds, duration) {
   const outputPath = path.join("/tmp", uuidv4() + "_clip.mp4");
-  log("Cutting clip: start=" + startSeconds + "s duration=" + clipLength + "s", "info");
+  const start = startSeconds || 0;
+  const clipDuration = duration || 30;
+  log("Cutting clip: start=" + start + "s duration=" + clipDuration + "s", "info");
   return new Promise((resolve, reject) => {
-    ffmpeg(inputPath)
-      .setStartTime(startSeconds)
-      .setDuration(clipLength)
-      .videoCodec("libx264")
-      .audioCodec("aac")
+    ffmpeg(inputPath).setStartTime(start).setDuration(clipDuration).videoCodec("libx264").audioCodec("aac")
       .outputOptions(["-preset ultrafast", "-crf 28", "-vf scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2", "-movflags +faststart", "-pix_fmt yuv420p"])
       .output(outputPath)
-      .on("end", () => { log("Clip cut done", "success"); resolve(outputPath); })
+      .on("end", () => { log("Clip ready: " + outputPath, "success"); resolve(outputPath); })
       .on("error", (err) => { cleanFile(outputPath); reject(new Error("FFmpeg error: " + err.message)); })
       .run();
     setTimeout(() => { cleanFile(outputPath); reject(new Error("FFmpeg timeout")); }, 180000);
   });
 }
 
-// ================================================
-// UPLOAD TO CLOUDINARY — real public HTTPS video URL
-// ================================================
 async function uploadToCloudinary(filePath, clipTitle) {
   log("Uploading to Cloudinary: " + clipTitle, "info");
   return new Promise((resolve, reject) => {
-    cloudinary.uploader.upload(filePath, {
-      resource_type: "video",
-      public_id: "clipagent_" + Date.now(),
-      folder: "clipagent",
-      overwrite: true
-    }, (error, result) => {
-      if (error) reject(new Error("Cloudinary error: " + error.message));
-      else { log("Cloudinary done: " + result.secure_url, "success"); resolve(result.secure_url); }
-    });
+    cloudinary.uploader.upload(filePath, { resource_type: "video", public_id: "clipagent_" + Date.now(), folder: "clipagent", overwrite: true },
+      (error, result) => {
+        if (error) reject(new Error("Cloudinary error: " + error.message));
+        else { log("Cloudinary done: " + result.secure_url, "success"); resolve(result.secure_url); }
+      }
+    );
   });
 }
 
-// ================================================
-// POST TO INSTAGRAM AS REEL — VIDEO ONLY, NO IMAGES
-// Pipeline: download → cut → upload → post → poll → publish
-// ================================================
 async function postToInstagram(clip) {
-  let rawVideoPath = null;
-  let clipVideoPath = null;
-
   try {
     const igId = process.env.INSTAGRAM_BUSINESS_ID || process.env.INSTAGRAM_PAGE_ID;
-    if (!ACCESS_TOKEN || ACCESS_TOKEN.length < 10) { log("Instagram skip: ACCESS_TOKEN missing", "warn"); return false; }
-    if (!igId) { log("Instagram skip: INSTAGRAM_PAGE_ID not set", "warn"); return false; }
-    if (!clip.videoId || clip.videoId === "demo") { log("Instagram skip: no valid video ID", "info"); return false; }
 
-    // Step 1: Download full video
-    rawVideoPath = await downloadYouTubeVideo(clip.videoId);
+    if (!ACCESS_TOKEN || ACCESS_TOKEN.length < 10) {
+      log("Instagram skip: ACCESS_TOKEN missing", "warn");
+      return false;
+    }
+    if (!igId) {
+      log("Instagram skip: INSTAGRAM_PAGE_ID not set", "warn");
+      return false;
+    }
+    if (!clip.videoId || clip.videoId === "demo") {
+      log("Instagram skip: no valid video ID", "info");
+      return false;
+    }
 
-    // Step 2: Cut to exact clip at user-selected timestamp
-    clipVideoPath = await cutVideoClip(rawVideoPath, clip.startSeconds || 0, clip.clipLength || 30);
+    log("Starting Instagram Reel for: " + clip.clipTitle, "info");
 
-    // Step 3: Upload to Cloudinary — get real public HTTPS URL
-    const videoUrl = await uploadToCloudinary(clipVideoPath, clip.clipTitle);
+    const cloudName = process.env.CLOUDINARY_CLOUD_NAME || "dj4mtzmjk";
+    const apiKey = process.env.CLOUDINARY_API_KEY || "196665315695659";
+    const apiSecret = process.env.CLOUDINARY_API_SECRET || "_ZJp2seaXrHEvizMpC6rVDNTvZ8";
 
-    // Step 4: Create Instagram Reel container — REELS only, never IMAGE
+    const startSecs = clip.startSeconds || 0;
+    const duration = Math.min(clip.clipLength || 30, 90);
+    const publicId = "clipagent/" + clip.videoId + "_" + startSecs;
+
+    const cloudinaryLib = require("cloudinary").v2;
+    cloudinaryLib.config({ cloud_name: cloudName, api_key: apiKey, api_secret: apiSecret });
+
+    // Step 1: Download with yt-dlp using best available format
+    const outputPath = require("path").join("/tmp", require("uuid").v4() + "_raw.mp4");
+    const clippedPath = require("path").join("/tmp", require("uuid").v4() + "_clip.mp4");
+    let videoUrl = "";
+
+    try {
+      // Use best[ext=mp4]/bestvideo+bestaudio/best - most compatible format selection
+      await new Promise((resolve, reject) => {
+        const ytdlpBin = (() => {
+          const locs = ["yt-dlp","/usr/local/bin/yt-dlp","/usr/bin/yt-dlp"];
+          for (const l of locs) {
+            try { require("child_process").execFileSync(l,["--version"],{timeout:5000}); return l; } catch(e) {}
+          }
+          return null;
+        })();
+
+        if (!ytdlpBin) { reject(new Error("yt-dlp not installed")); return; }
+
+        const args = [
+          "--no-playlist",
+          "--format", "best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best",
+          "--output", outputPath,
+          "--no-warnings",
+          "--socket-timeout", "30",
+          "--retries", "3"
+        ];
+
+        if (process.env.YOUTUBE_COOKIES) {
+          try {
+            const cookiesPath = "/tmp/yt_cookies_" + Date.now() + ".txt";
+            let c = "# Netscape HTTP Cookie File\n";
+            process.env.YOUTUBE_COOKIES.split(";").forEach(cookie => {
+              const eq = cookie.indexOf("=");
+              if (eq > 0) {
+                const name = cookie.slice(0, eq).trim();
+                const val = cookie.slice(eq + 1).trim();
+                c += ".youtube.com\tTRUE\t/\tTRUE\t9999999999\t" + name + "\t" + val + "\n";
+              }
+            });
+            fs.writeFileSync(cookiesPath, c);
+            args.push("--cookies", cookiesPath);
+          } catch(e) { log("Cookie error: " + e.message, "warn"); }
+        }
+
+        args.push("https://www.youtube.com/watch?v=" + clip.videoId);
+
+        const timer = setTimeout(() => { reject(new Error("yt-dlp timeout")); }, 120000);
+        require("child_process").execFile(ytdlpBin, args, { maxBuffer: 1024*1024*100 }, (err, stdout, stderr) => {
+          clearTimeout(timer);
+          if (err) { reject(new Error("yt-dlp error: " + (stderr || err.message).slice(0,300))); return; }
+          if (!fs.existsSync(outputPath)) { reject(new Error("yt-dlp: no output file")); return; }
+          resolve();
+        });
+      });
+
+      log("Download complete, cutting clip...", "info");
+
+      // Step 2: Cut clip with ffmpeg
+      await new Promise((resolve, reject) => {
+        require("fluent-ffmpeg")(outputPath)
+          .setStartTime(startSecs)
+          .setDuration(duration)
+          .videoCodec("libx264")
+          .audioCodec("aac")
+          .outputOptions(["-preset ultrafast","-crf 28","-vf scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2","-movflags +faststart","-pix_fmt yuv420p"])
+          .output(clippedPath)
+          .on("end", resolve)
+          .on("error", (e) => reject(new Error("FFmpeg: " + e.message)))
+          .run();
+        setTimeout(() => reject(new Error("FFmpeg timeout")), 180000);
+      });
+
+      log("Clip cut, uploading to Cloudinary...", "info");
+
+      // Step 3: Upload to Cloudinary
+      const uploadResult = await new Promise((resolve, reject) => {
+        cloudinaryLib.uploader.upload(clippedPath,
+          { resource_type: "video", public_id: publicId, overwrite: true },
+          (err, res) => { if (err) reject(err); else resolve(res); }
+        );
+      });
+      videoUrl = uploadResult.secure_url;
+      log("Cloudinary upload done: " + videoUrl.slice(0, 80), "success");
+
+    } catch (procErr) {
+      log("Video processing error: " + procErr.message, "warn");
+      return false;
+    } finally {
+      cleanFile(outputPath);
+      cleanFile(clippedPath);
+    }
+
+    if (!videoUrl) { log("No video URL — skipping post", "warn"); return false; }
+
+    // Step 4: Post to Instagram as Reel
+    log("Creating Instagram Reel container...", "info");
     const caption = clip.caption + "\n\n" + clip.clipTitle;
-    log("Creating Instagram Reel container: " + clip.clipTitle, "info");
 
     const createRes = await axios.post(
       "https://graph.facebook.com/v25.0/" + igId + "/media",
       { media_type: "REELS", video_url: videoUrl, caption: caption, access_token: ACCESS_TOKEN }
     );
 
-    if (!createRes.data || !createRes.data.id) { log("Instagram container failed: " + JSON.stringify(createRes.data), "warn"); return false; }
+    if (!createRes.data || !createRes.data.id) {
+      log("Container failed: " + JSON.stringify(createRes.data), "warn");
+      return false;
+    }
 
     const containerId = createRes.data.id;
-    log("Instagram container created: " + containerId, "info");
+    log("Container created: " + containerId, "info");
 
-    // Step 5: Poll until Instagram finishes processing (up to 3 minutes)
+    // Step 5: Poll until processed
     let ready = false;
     for (let i = 0; i < 36; i++) {
       await new Promise(r => setTimeout(r, 5000));
       try {
-        const statusRes = await axios.get("https://graph.facebook.com/v25.0/" + containerId + "?fields=status_code,status&access_token=" + ACCESS_TOKEN);
-        const code = statusRes.data.status_code;
-        log("Instagram status [" + (i+1) + "/36]: " + code, "info");
-        if (code === "FINISHED") { ready = true; break; }
-        if (code === "ERROR") { log("Instagram processing error: " + JSON.stringify(statusRes.data), "warn"); return false; }
-      } catch (pollErr) { log("Poll error: " + pollErr.message, "warn"); }
+        const s = await axios.get("https://graph.facebook.com/v25.0/" + containerId + "?fields=status_code&access_token=" + ACCESS_TOKEN);
+        log("Instagram status [" + (i+1) + "]: " + s.data.status_code, "info");
+        if (s.data.status_code === "FINISHED") { ready = true; break; }
+        if (s.data.status_code === "ERROR") { log("Instagram processing ERROR", "warn"); return false; }
+      } catch(e) { log("Poll error: " + e.message, "warn"); }
     }
 
-    if (!ready) { log("Instagram processing timed out: " + clip.clipTitle, "warn"); return false; }
+    if (!ready) { log("Instagram timed out: " + clip.clipTitle, "warn"); return false; }
 
-    // Step 6: Publish the Reel
-    const publishRes = await axios.post(
+    // Step 6: Publish
+    const pubRes = await axios.post(
       "https://graph.facebook.com/v25.0/" + igId + "/media_publish",
       { creation_id: containerId, access_token: ACCESS_TOKEN }
     );
 
-    if (publishRes.data && publishRes.data.id) { log("Instagram Reel PUBLISHED: " + clip.clipTitle + " | ID: " + publishRes.data.id, "success"); return true; }
-    log("Instagram publish failed: " + JSON.stringify(publishRes.data), "warn");
+    if (pubRes.data && pubRes.data.id) {
+      log("✅ Instagram Reel POSTED: " + clip.clipTitle + " | ID: " + pubRes.data.id, "success");
+      return true;
+    }
+
+    log("Publish failed: " + JSON.stringify(pubRes.data), "warn");
     return false;
 
   } catch (err) {
-    const msg = err.response && err.response.data && err.response.data.error ? err.response.data.error.message : err.message;
-    log("Instagram error: " + msg, "warn");
+    const msg = err.response && err.response.data && err.response.data.error
+      ? err.response.data.error.message
+      : err.message;
+    log("Instagram error: " + JSON.stringify(msg), "warn");
     return false;
-  } finally {
-    cleanFile(rawVideoPath);
-    cleanFile(clipVideoPath);
   }
 }
 
-// ================================================
-// SCAN CHANNEL
-// ================================================
+
 async function scanChannel(channel) {
   log("Scanning: " + channel.name, "info");
   channel.status = "processing";
@@ -491,26 +521,27 @@ async function scanChannel(channel) {
     if (!videos.length) { log("No videos found: " + channel.name, "info"); channel.status = "active"; return; }
     let videoIndex = 0;
     for (const video of videos.slice(0, 2)) {
-      if (videoIndex > 0) { log("Throttle: 15s delay", "info"); await new Promise(r => setTimeout(r, 15000)); }
+      if (videoIndex > 0) {
+        log("Scan throttle: 15s delay between videos", "info");
+        await new Promise(r => setTimeout(r, 15000));
+      }
       videoIndex++;
       const videoId = video.id && video.id.videoId;
       const title = video.snippet && video.snippet.title;
       if (!videoId || !title) continue;
       if (clips.find(c => c.videoId === videoId)) { log("Already clipped: " + title, "info"); continue; }
       log("AI analyzing: " + title, "info");
-      const suggestions = await analyzeWithClaude(channel, videoId, title);
+      const suggestions = await analyzeWithClaude(channel, title);
       for (const s of suggestions) {
-        const clip = { id: Date.now().toString() + Math.random().toString(36).slice(2, 7), channelId: channel.id, channelName: channel.name, videoId, videoTitle: title, clipTitle: s.title, startTime: s.startTime, endTime: s.endTime, startSeconds: s.startSeconds, clipLength: channel.clipLength, duration: channel.clipLength + "s", viralScore: s.viralScore, reason: s.reason, caption: s.caption, status: channel.autoPost ? "queued" : "ready", createdAt: new Date().toISOString(), postedAt: null };
+        const clip = { id: Date.now().toString() + Math.random().toString(36).slice(2, 7), channelId: channel.id, channelName: channel.name, videoId, videoTitle: title, clipTitle: s.title, startTime: s.startTime, endTime: s.endTime, startSeconds: s.startSeconds || 0, clipLength: channel.clipLength, duration: channel.clipLength + "s", viralScore: s.viralScore, reason: s.reason, caption: s.caption, status: channel.autoPost ? "queued" : "ready", createdAt: new Date().toISOString(), postedAt: null };
         clips.unshift(clip);
         channel.clipsGenerated++;
-        saveData();
-        log("Clip ready: " + s.title + " @ " + s.startTime + " Score: " + s.viralScore + "%", "success");
+        log("Clip ready: " + s.title + " Score: " + s.viralScore + "%", "success");
         if (channel.autoPost) await postClip(clip, channel);
       }
     }
   } catch (err) { log("Scan error: " + err.message, "error"); }
   channel.status = "active";
-  saveData();
 }
 
 async function postClip(clip, channel) {
@@ -519,25 +550,42 @@ async function postClip(clip, channel) {
   try {
     await waitForPostSlot();
     let success = false;
-    if (channel.postTo === "all" || channel.postTo === "instagram") success = await postToInstagram(clip);
-    if (success) { clip.status = "posted"; clip.postedAt = new Date().toISOString(); channel.postsPublished++; saveData(); log("Posted: " + clip.clipTitle, "success"); }
-    else { clip.status = "failed"; saveData(); log("Post failed: " + clip.clipTitle, "warn"); }
-  } catch (err) { log("Post error: " + err.message, "warn"); clip.status = "failed"; saveData(); }
+    if (channel.postTo === "all" || channel.postTo === "instagram") {
+      success = await postToInstagram(clip);
+    }
+    if (success) {
+      clip.status = "posted";
+      clip.postedAt = new Date().toISOString();
+      channel.postsPublished++;
+      log("Posted successfully: " + clip.clipTitle, "success");
+    } else {
+      clip.status = "failed";
+      log("Post failed — Instagram returned false: " + clip.clipTitle, "warn");
+    }
+  } catch (err) {
+    log("Post error: " + err.message, "warn");
+    clip.status = "failed";
+  }
 }
 
-// ================================================
-// CRON JOBS
-// ================================================
 cron.schedule("0 * * * *", async () => {
   try {
     const now = Date.now();
-    if (now - lastScanTime < MIN_SCAN_GAP_MS) { log("Scan throttle: skipping", "info"); return; }
+    const elapsed = now - lastScanTime;
+    if (elapsed < MIN_SCAN_GAP_MS) {
+      const waitMins = Math.ceil((MIN_SCAN_GAP_MS - elapsed) / 60000);
+      log("Scan throttle: skipping — next scan in " + waitMins + " min", "info");
+      return;
+    }
     lastScanTime = now;
     const active = channels.filter(c => c.status === "active");
     if (!active.length) return;
     log("Auto-scan: " + active.length + " channel(s)", "info");
     for (let i = 0; i < active.length; i++) {
-      if (i > 0) await new Promise(r => setTimeout(r, 15000));
+      if (i > 0) {
+        log("Channel throttle: 15s delay before next channel", "info");
+        await new Promise(r => setTimeout(r, 15000));
+      }
       await scanChannel(active[i]);
     }
   } catch (err) { log("Auto-scan error: " + err.message, "error"); }
@@ -546,7 +594,7 @@ cron.schedule("0 * * * *", async () => {
 cron.schedule("0 0 * * *", async () => {
   try {
     const r = await axios.get("https://graph.facebook.com/v25.0/oauth/access_token", { params: { grant_type: "fb_exchange_token", client_id: process.env.FACEBOOK_APP_ID, client_secret: process.env.FACEBOOK_APP_SECRET, fb_exchange_token: ACCESS_TOKEN } });
-    if (r.data.access_token) { ACCESS_TOKEN = r.data.access_token; saveData(); log("Token auto-refreshed", "success"); }
+    if (r.data.access_token) { ACCESS_TOKEN = r.data.access_token; saveData(); log("Token auto-refreshed and saved", "success"); }
   } catch (err) { log("Token refresh error: " + err.message, "warn"); }
 });
 
