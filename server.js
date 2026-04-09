@@ -290,6 +290,34 @@ async function downloadYouTubeVideo(videoId) {
 
   log("Downloading video: " + videoId, "info");
 
+  // Write cookies file once per download with unique path
+  const cookiesPath = "/tmp/yt_cookies_" + uuidv4() + ".txt";
+  let cookiesWritten = false;
+
+  if (process.env.YOUTUBE_COOKIES) {
+    try {
+      // Netscape cookie format — split on semicolons but preserve = inside values
+      const lines = ["# Netscape HTTP Cookie File", "# https://curl.haxx.se/rfc/cookie_spec.html", "# This is a generated file!  Do not edit.", ""];
+      process.env.YOUTUBE_COOKIES.split(";").forEach(pair => {
+        pair = pair.trim();
+        if (!pair) return;
+        const eqIdx = pair.indexOf("=");
+        if (eqIdx < 1) return;
+        const name = pair.slice(0, eqIdx).trim();
+        const value = pair.slice(eqIdx + 1).trim();
+        // Netscape format: domain  includeSubdomains  path  secure  expiry  name  value
+        lines.push(".youtube.com	TRUE	/	TRUE	2147483647	" + name + "	" + value);
+      });
+      fs.writeFileSync(cookiesPath, lines.join("\n") + "\n");
+      cookiesWritten = true;
+      log("Wrote " + (lines.length - 4) + " YouTube cookies to file", "info");
+    } catch (e) {
+      log("Cookie write error: " + e.message, "warn");
+    }
+  } else {
+    log("No YOUTUBE_COOKIES set — download may be rate-limited", "warn");
+  }
+
   return new Promise((resolve, reject) => {
     const args = [
       "--no-playlist",
@@ -298,44 +326,41 @@ async function downloadYouTubeVideo(videoId) {
       "--no-warnings",
       "--quiet",
       "--no-check-certificate",
-      "--extractor-args", "youtube:player_client=android",
-      "--user-agent", "com.google.android.youtube/17.36.4 (Linux; U; Android 12; GB) gzip",
-      videoUrl
+      "--extractor-args", "youtube:player_client=android,web",
+      "--user-agent", "com.google.android.youtube/17.36.4 (Linux; U; Android 12; GB) gzip"
     ];
 
-    const cookiesPath = "/tmp/yt_cookies_" + uuidv4() + ".txt";
-    if (process.env.YOUTUBE_COOKIES) {
-      try {
-        let cookieContent = "# Netscape HTTP Cookie File\n";
-        process.env.YOUTUBE_COOKIES.split(";").forEach(c => {
-          const eqIdx = c.indexOf("=");
-          if (eqIdx > 0) {
-            const name = c.slice(0, eqIdx).trim();
-            const value = c.slice(eqIdx + 1).trim();
-            cookieContent += ".youtube.com\tTRUE\t/\tTRUE\t9999999999\t" + name + "\t" + value + "\n";
-          }
-        });
-        fs.writeFileSync(cookiesPath, cookieContent);
-        args.unshift("--cookies", cookiesPath);
-        log("Using YouTube cookies", "info");
-      } catch (e) { log("Cookie write error: " + e.message, "warn"); }
+    if (cookiesWritten) {
+      args.push("--cookies", cookiesPath);
+      log("Using cookies file for download", "info");
     }
 
-    const timer = setTimeout(() => { cleanFile(outputPath); cleanFile(cookiesPath); reject(new Error("yt-dlp timeout after 120s")); }, 120000);
+    args.push(videoUrl);
+
+    const timer = setTimeout(() => {
+      cleanFile(outputPath);
+      cleanFile(cookiesPath);
+      reject(new Error("yt-dlp timeout after 120s"));
+    }, 120000);
+
     execFile(ytdlpBin, args, { maxBuffer: 1024 * 1024 * 100 }, (error, stdout, stderr) => {
       clearTimeout(timer);
       cleanFile(cookiesPath);
       if (error) {
         cleanFile(outputPath);
-        const msg = (stderr || error.message || "").slice(0, 300);
-        if (msg.includes("Sign in") || msg.includes("bot")) {
-          reject(new Error("YouTube blocked download — check YOUTUBE_COOKIES env variable"));
+        const msg = (stderr || error.message || "").slice(0, 400);
+        log("yt-dlp stderr: " + msg, "warn");
+        if (msg.includes("Sign in") || msg.includes("bot") || msg.includes("confirm")) {
+          reject(new Error("YouTube bot check failed — cookies may be expired, re-export from browser"));
         } else {
           reject(new Error("yt-dlp error: " + msg));
         }
         return;
       }
-      if (!fs.existsSync(outputPath) || fs.statSync(outputPath).size === 0) { reject(new Error("yt-dlp: output file missing or empty")); return; }
+      if (!fs.existsSync(outputPath) || fs.statSync(outputPath).size === 0) {
+        reject(new Error("yt-dlp: output file missing or empty"));
+        return;
+      }
       log("Download complete: " + outputPath, "success");
       resolve(outputPath);
     });
