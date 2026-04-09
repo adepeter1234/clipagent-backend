@@ -321,7 +321,8 @@ async function downloadYouTubeVideo(videoId) {
   return new Promise((resolve, reject) => {
     const args = [
       "--no-playlist",
-      "--format", "bestvideo[ext=mp4][height<=480]+bestaudio[ext=m4a]/best[ext=mp4][height<=480]/best[height<=480]/best",
+      "--format", "mp4/bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
+      "--merge-output-format", "mp4",
       "--output", outputPath,
       "--no-warnings",
       "--quiet",
