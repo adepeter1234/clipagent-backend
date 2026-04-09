@@ -290,36 +290,36 @@ async function downloadYouTubeVideo(videoId) {
 
   log("Downloading video: " + videoId, "info");
 
-  // Write cookies file once per download with unique path
+  // Build cookies file from env var
   const cookiesPath = "/tmp/yt_cookies_" + uuidv4() + ".txt";
-  let cookiesWritten = false;
+  let cookiesArg = [];
 
   if (process.env.YOUTUBE_COOKIES) {
     try {
-      // Netscape cookie format — split on semicolons but preserve = inside values
-      const lines = ["# Netscape HTTP Cookie File", "# https://curl.haxx.se/rfc/cookie_spec.html", "# This is a generated file!  Do not edit.", ""];
-      process.env.YOUTUBE_COOKIES.split(";").forEach(pair => {
+      var rows = [];
+      process.env.YOUTUBE_COOKIES.split(";").forEach(function(pair) {
         pair = pair.trim();
         if (!pair) return;
-        const eqIdx = pair.indexOf("=");
+        var eqIdx = pair.indexOf("=");
         if (eqIdx < 1) return;
-        const name = pair.slice(0, eqIdx).trim();
-        const value = pair.slice(eqIdx + 1).trim();
-        // Netscape format: domain  includeSubdomains  path  secure  expiry  name  value
-        lines.push(".youtube.com	TRUE	/	TRUE	2147483647	" + name + "	" + value);
+        var name = pair.slice(0, eqIdx).trim();
+        var value = pair.slice(eqIdx + 1);
+        if (!name) return;
+        rows.push(".youtube.com	TRUE	/	TRUE	2147483647	" + name + "	" + value);
       });
-      fs.writeFileSync(cookiesPath, lines.join("\n") + "\n");
-      cookiesWritten = true;
-      log("Wrote " + (lines.length - 4) + " YouTube cookies to file", "info");
+      var fileContent = "# Netscape HTTP Cookie File\n# This is a generated file!  Do not edit.\n\n" + rows.join("\n") + "\n";
+      fs.writeFileSync(cookiesPath, fileContent, "utf8");
+      cookiesArg = ["--cookies", cookiesPath];
+      log("Wrote " + rows.length + " cookies from YOUTUBE_COOKIES env", "info");
     } catch (e) {
       log("Cookie write error: " + e.message, "warn");
     }
   } else {
-    log("No YOUTUBE_COOKIES set — download may be rate-limited", "warn");
+    log("No YOUTUBE_COOKIES env set - download may be blocked", "warn");
   }
 
-  return new Promise((resolve, reject) => {
-    const args = [
+  return new Promise(function(resolve, reject) {
+    var args = [
       "--no-playlist",
       "--format", "mp4/bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
       "--merge-output-format", "mp4",
@@ -331,28 +331,28 @@ async function downloadYouTubeVideo(videoId) {
       "--user-agent", "com.google.android.youtube/17.36.4 (Linux; U; Android 12; GB) gzip"
     ];
 
-    if (cookiesWritten) {
-      args.push("--cookies", cookiesPath);
-      log("Using cookies file for download", "info");
+    if (cookiesArg.length) {
+      args = args.concat(cookiesArg);
+      log("Using cookies file for authentication", "info");
     }
 
     args.push(videoUrl);
 
-    const timer = setTimeout(() => {
+    var timer = setTimeout(function() {
       cleanFile(outputPath);
       cleanFile(cookiesPath);
       reject(new Error("yt-dlp timeout after 120s"));
     }, 120000);
 
-    execFile(ytdlpBin, args, { maxBuffer: 1024 * 1024 * 100 }, (error, stdout, stderr) => {
+    execFile(ytdlpBin, args, { maxBuffer: 1024 * 1024 * 100 }, function(error, stdout, stderr) {
       clearTimeout(timer);
       cleanFile(cookiesPath);
       if (error) {
         cleanFile(outputPath);
-        const msg = (stderr || error.message || "").slice(0, 400);
+        var msg = (stderr || error.message || "").slice(0, 400);
         log("yt-dlp stderr: " + msg, "warn");
-        if (msg.includes("Sign in") || msg.includes("bot") || msg.includes("confirm")) {
-          reject(new Error("YouTube bot check failed — cookies may be expired, re-export from browser"));
+        if (msg.indexOf("Sign in") >= 0 || msg.indexOf("bot") >= 0 || msg.indexOf("confirm") >= 0) {
+          reject(new Error("YouTube bot check failed - update YOUTUBE_COOKIES in Railway env vars"));
         } else {
           reject(new Error("yt-dlp error: " + msg));
         }
